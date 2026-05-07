@@ -561,6 +561,61 @@ func DeletePrayerSubject(c *gin.Context) {
 		return
 	}
 
+	// Block deletion of contacts that originate from a circle the requesting
+	// user is still a member of. Two cases:
+	//
+	//   1) Group-type subjects are tracked in prayer_subject_group_profile.
+	//      Block when the linked group_profile is one the user is in.
+	//   2) Individual contacts aren't in psgp by schema (the trigger only
+	//      accepts group-type subjects), so we infer the link semantically:
+	//      if the contact's user_profile_id is a member of any active
+	//      user_group the requesting user is also in, block.
+	var psgpHits int
+	_, err = initializers.DB.From("prayer_subject_group_profile").
+		Select(goqu.COUNT(goqu.I("prayer_subject_group_profile.prayer_subject_group_profile_id"))).
+		Join(
+			goqu.T("user_group"),
+			goqu.On(goqu.Ex{"prayer_subject_group_profile.group_profile_id": goqu.I("user_group.group_profile_id")}),
+		).
+		Where(
+			goqu.C("prayer_subject_id").Table("prayer_subject_group_profile").Eq(subjectID),
+			goqu.C("user_profile_id").Table("user_group").Eq(currentUser.User_Profile_ID),
+			goqu.C("is_active").Table("user_group").IsTrue(),
+		).
+		ScanVal(&psgpHits)
+	if err != nil {
+		log.Println("Failed to check group-type circle linkage:", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check circle membership", "details": err.Error()})
+		return
+	}
+
+	sharedCircleHits := 0
+	if existingSubject.User_Profile_ID != nil && *existingSubject.User_Profile_ID > 0 {
+		_, err = initializers.DB.From(goqu.T("user_group").As("ug_subject")).
+			Select(goqu.COUNT(goqu.I("ug_subject.user_group_id"))).
+			Join(
+				goqu.T("user_group").As("ug_current"),
+				goqu.On(goqu.Ex{"ug_subject.group_profile_id": goqu.I("ug_current.group_profile_id")}),
+			).
+			Where(
+				goqu.C("user_profile_id").Table("ug_subject").Eq(*existingSubject.User_Profile_ID),
+				goqu.C("user_profile_id").Table("ug_current").Eq(currentUser.User_Profile_ID),
+				goqu.C("is_active").Table("ug_subject").IsTrue(),
+				goqu.C("is_active").Table("ug_current").IsTrue(),
+			).
+			ScanVal(&sharedCircleHits)
+		if err != nil {
+			log.Println("Failed to check shared-circle membership for individual contact:", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check circle membership", "details": err.Error()})
+			return
+		}
+	}
+
+	if psgpHits > 0 || sharedCircleHits > 0 {
+		c.JSON(http.StatusConflict, gin.H{"error": "This contact is from a prayer circle you're a member of and can't be deleted"})
+		return
+	}
+
 	// Check for associated prayers
 	var prayerCount int
 	_, err = initializers.DB.From("prayer").
