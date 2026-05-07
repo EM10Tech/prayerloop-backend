@@ -388,8 +388,6 @@ func GetUserGroups(c *gin.Context) {
 		return
 	}
 
-	log.Println(sql, args)
-
 	var groups []models.GroupProfile
 	err = initializers.DB.ScanStructs(&groups, sql, args...)
 	if err != nil {
