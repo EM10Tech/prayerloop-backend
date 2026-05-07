@@ -115,6 +115,12 @@ func CreateGroup(c *gin.Context) {
 		}
 	}
 
+	// Wire up the per-user circle contact graph. For the creator alone there
+	// are no other members yet, so this just records the join-table row for
+	// the auto-created group contact.
+	logCircleContactErr("EnsureCircleContactsForUser (CreateGroup)",
+		EnsureCircleContactsForUser(user.User_Profile_ID, group.Group_Profile_ID, group.Group_Name))
+
 	c.JSON(http.StatusCreated, group)
 }
 
@@ -338,6 +344,11 @@ func DeleteGroup(c *gin.Context) {
 		return
 	}
 
+	// Tear down the contact graph BEFORE deleting the group so the helper can
+	// still query members and join rows.
+	logCircleContactErr("RemoveAllCircleContacts",
+		RemoveAllCircleContacts(groupID))
+
 	// Now delete the group itself (group_invite will cascade automatically)
 	deleteGroupStmt := initializers.DB.Delete("group_profile").
 		Where(goqu.C("group_profile_id").Eq(groupID))
@@ -497,6 +508,15 @@ func AddUserToGroup(c *gin.Context) {
 		return
 	}
 
+	// Wire up circle contacts for the user being added (not the actor).
+	groupName, gnErr := GetGroupNameByID(groupID)
+	if gnErr != nil {
+		log.Printf("Failed to fetch group name for circle contact setup: %v", gnErr)
+		groupName = ""
+	}
+	logCircleContactErr("EnsureCircleContactsForUser (AddUserToGroup)",
+		EnsureCircleContactsForUser(userID, groupID, groupName))
+
 	c.JSON(http.StatusOK, gin.H{"message": "User added to group successfully"})
 }
 
@@ -516,12 +536,7 @@ func RemoveUserFromGroup(c *gin.Context) {
 		return
 	}
 
-	if !isAdmin && userID != currentUser.User_Profile_ID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "You don't have permission to remove this user from the group"})
-		return
-	}
-
-	// Fetch user and group information for email
+	// Fetch user and group information (group creator needed for auth check, both used for email)
 	var user models.UserProfile
 	var group models.GroupProfile
 
@@ -534,11 +549,16 @@ func RemoveUserFromGroup(c *gin.Context) {
 	}
 
 	_, err = initializers.DB.From("group_profile").
-		Select("group_name").
+		Select("created_by", "group_name").
 		Where(goqu.C("group_profile_id").Eq(groupID)).
 		ScanStruct(&group)
 	if err != nil {
 		log.Printf("Failed to fetch group for email: %v", err)
+	}
+
+	if !isAdmin && userID != currentUser.User_Profile_ID && group.Created_By != currentUser.User_Profile_ID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You don't have permission to remove this user from the group"})
+		return
 	}
 
 	// Determine if this is voluntary leave or forced removal
@@ -567,6 +587,11 @@ func RemoveUserFromGroup(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User is not a member of this group or already removed"})
 		return
 	}
+
+	// Tear down the leaving user's circle contact graph (their own group-type
+	// subject, plus join rows for individual contacts on either side of them).
+	logCircleContactErr("RemoveCircleContactsForLeavingUser",
+		RemoveCircleContactsForLeavingUser(userID, groupID))
 
 	// Send appropriate email notification
 	emailService := services.GetEmailService()
