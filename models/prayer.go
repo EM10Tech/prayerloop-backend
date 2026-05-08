@@ -47,6 +47,7 @@ type UserPrayer struct {
 	Category_Color                 *string    `json:"categoryColor,omitempty" db:"category_color" goqu:"skipinsert"`
 	Category_Display_Seq           *int       `json:"categoryDisplaySequence,omitempty" db:"category_display_sequence" goqu:"skipinsert"`
 	Comment_Count                  int        `json:"commentCount" db:"comment_count" goqu:"skipinsert"`
+	Is_Circle_Request              bool       `json:"isCircleRequest" db:"is_circle_request" goqu:"skipinsert"`
 }
 
 type PrayerCreate struct {

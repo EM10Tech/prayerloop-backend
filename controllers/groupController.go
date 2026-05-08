@@ -134,6 +134,11 @@ func GetGroup(c *gin.Context) {
 		return
 	}
 
+	// prayer_subject_id is resolved per-viewer: the viewer's own group-type
+	// prayer_subject (linked via prayer_subject_group_profile) takes precedence
+	// over the static group_profile.prayer_subject_id, which only ever points
+	// at the creator's anchor. This lets non-creator members successfully send
+	// their own subject id to CreateGroupPrayer.
 	var group models.GroupProfile
 	found, err := initializers.DB.From("group_profile").
 		Select(
@@ -145,11 +150,20 @@ func GetGroup(c *gin.Context) {
 			goqu.I("group_profile.updated_by"),
 			goqu.I("group_profile.datetime_create"),
 			goqu.I("group_profile.datetime_update"),
-			goqu.I("group_profile.prayer_subject_id"),
+			goqu.L(
+				"COALESCE(prayer_subject_group_profile.prayer_subject_id, group_profile.prayer_subject_id)",
+			).As("prayer_subject_id"),
 		).
 		Join(
 			goqu.T("user_group"),
 			goqu.On(goqu.Ex{"group_profile.group_profile_id": goqu.I("user_group.group_profile_id")}),
+		).
+		LeftJoin(
+			goqu.T("prayer_subject_group_profile"),
+			goqu.On(goqu.And(
+				goqu.Ex{"prayer_subject_group_profile.group_profile_id": goqu.I("group_profile.group_profile_id")},
+				goqu.Ex{"prayer_subject_group_profile.created_by": user.User_Profile_ID},
+			)),
 		).
 		Where(
 			goqu.Ex{
@@ -678,6 +692,11 @@ func GetGroupPrayers(c *gin.Context) {
 
 	var userPrayers []models.UserPrayer
 
+	// is_circle_request is true when the prayer's subject is linked to THIS
+	// group via prayer_subject_group_profile — i.e. it's a member's group-type
+	// "circle prayer" subject, regardless of which member authored the prayer.
+	// Drives the PRAYER CIRCLE REQUESTS vs SHARED PRAYER REQUESTS split on
+	// mobile.
 	dbErr := initializers.DB.From("prayer").
 		Select(
 			goqu.I("prayer.prayer_id"),
@@ -703,6 +722,7 @@ func GetGroupPrayers(c *gin.Context) {
 			goqu.I("prayer_category.category_name"),
 			goqu.I("prayer_category.category_color"),
 			goqu.I("prayer_category.display_sequence").As("category_display_sequence"),
+			goqu.L("prayer_subject_group_profile.prayer_subject_group_profile_id IS NOT NULL").As("is_circle_request"),
 		).
 		Join(
 			goqu.T("prayer_access"),
@@ -711,6 +731,13 @@ func GetGroupPrayers(c *gin.Context) {
 		LeftJoin(
 			goqu.T("prayer_subject"),
 			goqu.On(goqu.Ex{"prayer.prayer_subject_id": goqu.I("prayer_subject.prayer_subject_id")}),
+		).
+		LeftJoin(
+			goqu.T("prayer_subject_group_profile"),
+			goqu.On(goqu.And(
+				goqu.Ex{"prayer_subject_group_profile.prayer_subject_id": goqu.I("prayer.prayer_subject_id")},
+				goqu.Ex{"prayer_subject_group_profile.group_profile_id": groupID},
+			)),
 		).
 		LeftJoin(
 			goqu.T("prayer_category_item"),
