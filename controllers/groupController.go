@@ -115,6 +115,12 @@ func CreateGroup(c *gin.Context) {
 		}
 	}
 
+	// Wire up the per-user circle contact graph. For the creator alone there
+	// are no other members yet, so this just records the join-table row for
+	// the auto-created group contact.
+	logCircleContactErr("EnsureCircleContactsForUser (CreateGroup)",
+		EnsureCircleContactsForUser(user.User_Profile_ID, group.Group_Profile_ID, group.Group_Name))
+
 	c.JSON(http.StatusCreated, group)
 }
 
@@ -128,6 +134,11 @@ func GetGroup(c *gin.Context) {
 		return
 	}
 
+	// prayer_subject_id is resolved per-viewer: the viewer's own group-type
+	// prayer_subject (linked via prayer_subject_group_profile) takes precedence
+	// over the static group_profile.prayer_subject_id, which only ever points
+	// at the creator's anchor. This lets non-creator members successfully send
+	// their own subject id to CreateGroupPrayer.
 	var group models.GroupProfile
 	found, err := initializers.DB.From("group_profile").
 		Select(
@@ -139,11 +150,20 @@ func GetGroup(c *gin.Context) {
 			goqu.I("group_profile.updated_by"),
 			goqu.I("group_profile.datetime_create"),
 			goqu.I("group_profile.datetime_update"),
-			goqu.I("group_profile.prayer_subject_id"),
+			goqu.L(
+				"COALESCE(prayer_subject_group_profile.prayer_subject_id, group_profile.prayer_subject_id)",
+			).As("prayer_subject_id"),
 		).
 		Join(
 			goqu.T("user_group"),
 			goqu.On(goqu.Ex{"group_profile.group_profile_id": goqu.I("user_group.group_profile_id")}),
+		).
+		LeftJoin(
+			goqu.T("prayer_subject_group_profile"),
+			goqu.On(goqu.And(
+				goqu.Ex{"prayer_subject_group_profile.group_profile_id": goqu.I("group_profile.group_profile_id")},
+				goqu.Ex{"prayer_subject_group_profile.created_by": user.User_Profile_ID},
+			)),
 		).
 		Where(
 			goqu.Ex{
@@ -338,6 +358,11 @@ func DeleteGroup(c *gin.Context) {
 		return
 	}
 
+	// Tear down the contact graph BEFORE deleting the group so the helper can
+	// still query members and join rows.
+	logCircleContactErr("RemoveAllCircleContacts",
+		RemoveAllCircleContacts(groupID))
+
 	// Now delete the group itself (group_invite will cascade automatically)
 	deleteGroupStmt := initializers.DB.Delete("group_profile").
 		Where(goqu.C("group_profile_id").Eq(groupID))
@@ -497,6 +522,15 @@ func AddUserToGroup(c *gin.Context) {
 		return
 	}
 
+	// Wire up circle contacts for the user being added (not the actor).
+	groupName, gnErr := GetGroupNameByID(groupID)
+	if gnErr != nil {
+		log.Printf("Failed to fetch group name for circle contact setup: %v", gnErr)
+		groupName = ""
+	}
+	logCircleContactErr("EnsureCircleContactsForUser (AddUserToGroup)",
+		EnsureCircleContactsForUser(userID, groupID, groupName))
+
 	c.JSON(http.StatusOK, gin.H{"message": "User added to group successfully"})
 }
 
@@ -516,12 +550,7 @@ func RemoveUserFromGroup(c *gin.Context) {
 		return
 	}
 
-	if !isAdmin && userID != currentUser.User_Profile_ID {
-		c.JSON(http.StatusForbidden, gin.H{"error": "You don't have permission to remove this user from the group"})
-		return
-	}
-
-	// Fetch user and group information for email
+	// Fetch user and group information (group creator needed for auth check, both used for email)
 	var user models.UserProfile
 	var group models.GroupProfile
 
@@ -534,11 +563,16 @@ func RemoveUserFromGroup(c *gin.Context) {
 	}
 
 	_, err = initializers.DB.From("group_profile").
-		Select("group_name").
+		Select("created_by", "group_name").
 		Where(goqu.C("group_profile_id").Eq(groupID)).
 		ScanStruct(&group)
 	if err != nil {
 		log.Printf("Failed to fetch group for email: %v", err)
+	}
+
+	if !isAdmin && userID != currentUser.User_Profile_ID && group.Created_By != currentUser.User_Profile_ID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "You don't have permission to remove this user from the group"})
+		return
 	}
 
 	// Determine if this is voluntary leave or forced removal
@@ -567,6 +601,11 @@ func RemoveUserFromGroup(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User is not a member of this group or already removed"})
 		return
 	}
+
+	// Tear down the leaving user's circle contact graph (their own group-type
+	// subject, plus join rows for individual contacts on either side of them).
+	logCircleContactErr("RemoveCircleContactsForLeavingUser",
+		RemoveCircleContactsForLeavingUser(userID, groupID))
 
 	// Send appropriate email notification
 	emailService := services.GetEmailService()
@@ -653,6 +692,11 @@ func GetGroupPrayers(c *gin.Context) {
 
 	var userPrayers []models.UserPrayer
 
+	// is_circle_request is true when the prayer's subject is linked to THIS
+	// group via prayer_subject_group_profile — i.e. it's a member's group-type
+	// "circle prayer" subject, regardless of which member authored the prayer.
+	// Drives the PRAYER CIRCLE REQUESTS vs SHARED PRAYER REQUESTS split on
+	// mobile.
 	dbErr := initializers.DB.From("prayer").
 		Select(
 			goqu.I("prayer.prayer_id"),
@@ -678,6 +722,7 @@ func GetGroupPrayers(c *gin.Context) {
 			goqu.I("prayer_category.category_name"),
 			goqu.I("prayer_category.category_color"),
 			goqu.I("prayer_category.display_sequence").As("category_display_sequence"),
+			goqu.L("prayer_subject_group_profile.prayer_subject_group_profile_id IS NOT NULL").As("is_circle_request"),
 		).
 		Join(
 			goqu.T("prayer_access"),
@@ -686,6 +731,13 @@ func GetGroupPrayers(c *gin.Context) {
 		LeftJoin(
 			goqu.T("prayer_subject"),
 			goqu.On(goqu.Ex{"prayer.prayer_subject_id": goqu.I("prayer_subject.prayer_subject_id")}),
+		).
+		LeftJoin(
+			goqu.T("prayer_subject_group_profile"),
+			goqu.On(goqu.And(
+				goqu.Ex{"prayer_subject_group_profile.prayer_subject_id": goqu.I("prayer.prayer_subject_id")},
+				goqu.Ex{"prayer_subject_group_profile.group_profile_id": groupID},
+			)),
 		).
 		LeftJoin(
 			goqu.T("prayer_category_item"),

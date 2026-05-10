@@ -613,13 +613,10 @@ func RemovePrayerAccess(c *gin.Context) {
 
 		// Allow deletion if user is admin, prayer creator, or group creator
 		canDelete := admin || existingPrayer.Created_By == userID || group.Created_By == userID
-		log.Printf("[RemovePrayerAccess] Group access removal - userID: %d, prayerCreator: %d, groupCreator: %d, admin: %v, canDelete (before subject check): %v",
-			userID, existingPrayer.Created_By, group.Created_By, admin, canDelete)
 
 		// Check if user is linked subject (needed for notification regardless of other auth)
 		var isLinkedSubject bool
 		if existingPrayer.Prayer_Subject_ID != nil {
-			log.Printf("[RemovePrayerAccess] Checking if user is linked subject - Prayer_Subject_ID: %d", *existingPrayer.Prayer_Subject_ID)
 			var prayerSubject models.PrayerSubject
 			subjectFound, err := initializers.DB.From("prayer_subject").
 				Select("prayer_subject_id", "user_profile_id", "link_status").
@@ -627,8 +624,6 @@ func RemovePrayerAccess(c *gin.Context) {
 				ScanStruct(&prayerSubject)
 
 			if err == nil && subjectFound {
-				log.Printf("[RemovePrayerAccess] Found prayer subject - user_profile_id: %v, link_status: %s",
-					prayerSubject.User_Profile_ID, prayerSubject.Link_Status)
 				if prayerSubject.User_Profile_ID != nil &&
 					*prayerSubject.User_Profile_ID == userID &&
 					prayerSubject.Link_Status == "linked" {
@@ -642,7 +637,6 @@ func RemovePrayerAccess(c *gin.Context) {
 			linkedSubjectRemoving = true
 			groupNameForNotification = group.Group_Name
 			groupIDForNotification = group.Group_Profile_ID
-			log.Printf("[RemovePrayerAccess] Linked subject confirmed - will send notification after deletion")
 			// Get subject's display name
 			var subjectUser models.UserProfile
 			userFound, _ := initializers.DB.From("user_profile").
@@ -784,8 +778,6 @@ func RemovePrayerAccess(c *gin.Context) {
 
 	// Notify prayer creator if linked subject removed from group
 	if linkedSubjectRemoving {
-		log.Printf("[RemovePrayerAccess] Triggering PRAYER_REMOVED_FROM_GROUP notification - creator: %d, prayer: %d, group: %d, subject: %d, subjectName: %s, groupName: %s",
-			existingPrayer.Created_By, prayerId, groupIDForNotification, userID, linkedSubjectName, groupNameForNotification)
 		go services.NotifyCreatorOfPrayerRemovedFromGroup(
 			existingPrayer.Created_By,
 			prayerId,
@@ -833,7 +825,6 @@ func UpdatePrayer(c *gin.Context) {
 
 	// Check if user is authorized to edit this prayer
 	// Allowed: admin, prayer creator, OR linked subject
-	log.Printf("DEBUG UpdatePrayer: userID=%d, existingPrayer.Created_By=%d, admin=%v", userID, existingPrayer.Created_By, admin)
 	canEdit := admin || existingPrayer.Created_By == userID
 
 	// If not already authorized, check if user is the linked subject
@@ -1242,14 +1233,20 @@ func GetPrayerAccessRecords(c *gin.Context) {
 		return
 	}
 
-	// Extract just the group IDs
+	// Build paired response (groupId + prayerAccessId) and a flat groupIds list for back-compat
 	groupIds := make([]int, len(accessRecords))
+	circles := make([]gin.H, len(accessRecords))
 	for i, record := range accessRecords {
 		groupIds[i] = record.Access_Type_ID
+		circles[i] = gin.H{
+			"groupId":        record.Access_Type_ID,
+			"prayerAccessId": record.Prayer_Access_ID,
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": "Prayer access records retrieved successfully",
+		"message":  "Prayer access records retrieved successfully",
 		"groupIds": groupIds,
+		"circles":  circles,
 	})
 }

@@ -355,6 +355,8 @@ func GetUserGroups(c *gin.Context) {
 		return
 	}
 
+	// prayer_subject_id is resolved per-viewer (see GetGroup for rationale): the
+	// viewer's psgp anchor takes precedence over the static creator-only column.
 	query := initializers.DB.From("user_group").
 		Select(
 			"group_profile.group_profile_id",
@@ -366,12 +368,21 @@ func GetUserGroups(c *gin.Context) {
 			"group_profile.created_by",
 			"group_profile.updated_by",
 			"group_profile.deleted",
-			"group_profile.prayer_subject_id",
+			goqu.L(
+				"COALESCE(prayer_subject_group_profile.prayer_subject_id, group_profile.prayer_subject_id)",
+			).As("prayer_subject_id"),
 			"user_group.group_display_sequence",
 		).
 		InnerJoin(
 			goqu.T("group_profile"),
 			goqu.On(goqu.Ex{"user_group.group_profile_id": goqu.I("group_profile.group_profile_id")}),
+		).
+		LeftJoin(
+			goqu.T("prayer_subject_group_profile"),
+			goqu.On(goqu.And(
+				goqu.Ex{"prayer_subject_group_profile.group_profile_id": goqu.I("group_profile.group_profile_id")},
+				goqu.Ex{"prayer_subject_group_profile.created_by": userID},
+			)),
 		).
 		Where(
 			goqu.And(
@@ -387,8 +398,6 @@ func GetUserGroups(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to construct query", "details": err.Error()})
 		return
 	}
-
-	log.Println(sql, args)
 
 	var groups []models.GroupProfile
 	err = initializers.DB.ScanStructs(&groups, sql, args...)

@@ -156,6 +156,16 @@ func JoinGroup(c *gin.Context) {
 		return
 	}
 
+	// Fix: prior to migration 025 this code path created zero contacts for the
+	// joining user. Wire up their circle contact graph now.
+	groupName, gnErr := GetGroupNameByID(groupID)
+	if gnErr != nil {
+		log.Printf("Failed to fetch group name for circle contact setup: %v", gnErr)
+		groupName = "" // Helper will tolerate; downstream notifications re-fetch.
+	}
+	logCircleContactErr("EnsureCircleContactsForUser (JoinGroup)",
+		EnsureCircleContactsForUser(currentUser.User_Profile_ID, groupID, groupName))
+
 	update := initializers.DB.Update("group_invite").
 		Set(goqu.Record{
 			"is_active":       false,
