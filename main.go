@@ -37,6 +37,9 @@ func main() {
 	router.GET("/privacy", func(c *gin.Context) {
 		c.File("./static/privacy.html")
 	})
+	router.GET("/delete-account", func(c *gin.Context) {
+		c.File("./static/delete-account.html")
+	})
 
 	// Password reset endpoints
 	router.POST("/auth/forgot-password", middlewares.RateLimitMiddleware(2, 2, getKey), controllers.ForgotPassword)

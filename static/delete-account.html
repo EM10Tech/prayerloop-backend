@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Delete Your Account — prayerloop</title>
+  <style>
+    :root {
+      --brand: #90c590;
+      --brand-dark: #5f9d6a;
+      --ink: #1f2d24;
+      --muted: #5a6b60;
+      --bg: #f6f9f6;
+      --card: #ffffff;
+      --border: #e2ebe3;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      line-height: 1.6;
+    }
+    .wrap {
+      max-width: 680px;
+      margin: 0 auto;
+      padding: 32px 20px 64px;
+    }
+    header {
+      text-align: center;
+      padding: 24px 0 8px;
+    }
+    header h1 {
+      font-size: 28px;
+      margin: 12px 0 4px;
+    }
+    header .sub {
+      color: var(--muted);
+      font-size: 15px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 24px 24px;
+      margin-top: 24px;
+    }
+    h2 {
+      font-size: 19px;
+      margin: 4px 0 12px;
+      color: var(--brand-dark);
+    }
+    ol, ul { padding-left: 22px; }
+    li { margin: 6px 0; }
+    .email-btn {
+      display: inline-block;
+      background: var(--brand);
+      color: #fff;
+      text-decoration: none;
+      font-weight: 600;
+      padding: 12px 22px;
+      border-radius: 10px;
+      margin-top: 8px;
+    }
+    .email-btn:hover { background: var(--brand-dark); }
+    code {
+      background: #eef4ee;
+      padding: 2px 6px;
+      border-radius: 5px;
+      font-size: 14px;
+    }
+    .note {
+      font-size: 14px;
+      color: var(--muted);
+    }
+    footer {
+      text-align: center;
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 36px;
+    }
+    footer a { color: var(--brand-dark); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Delete Your prayerloop Account</h1>
+      <div class="sub">How to permanently delete your account and associated data</div>
+    </header>
+
+    <div class="card">
+      <h2>Option 1 — Delete in the app (fastest)</h2>
+      <p>If you still have prayerloop installed, you can delete your account immediately:</p>
+      <ol>
+        <li>Open the prayerloop app and sign in.</li>
+        <li>Go to <strong>Settings</strong> &rarr; <strong>Account</strong>.</li>
+        <li>Tap <strong>Delete Account</strong> and confirm.</li>
+      </ol>
+      <p class="note">Your account and data are removed right away — no waiting period.</p>
+    </div>
+
+    <div class="card">
+      <h2>Option 2 — Request deletion by email</h2>
+      <p>
+        If you've already uninstalled the app or can't sign in, email us from the
+        address associated with your account and we'll process the deletion for you:
+      </p>
+      <a class="email-btn" href="mailto:support@prayerloop.io?subject=Account%20Deletion%20Request&body=Please%20delete%20my%20prayerloop%20account%20and%20associated%20data.%20My%20account%20email%20is%3A%20">
+        Email support@prayerloop.io
+      </a>
+      <p class="note" style="margin-top:14px;">
+        Please send your request from, or include, the email address on your account so we can verify it.
+        We will complete the deletion within <strong>30 days</strong> of a verified request.
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>What gets deleted</h2>
+      <p>When your account is deleted, we permanently remove:</p>
+      <ul>
+        <li>Your user profile and login credentials</li>
+        <li>Prayers you created</li>
+        <li>Your prayer history, sessions, and usage statistics</li>
+        <li>Your app preferences and notification settings</li>
+        <li>Your group memberships and any group invites you created</li>
+        <li>Push notification tokens and password-reset tokens</li>
+      </ul>
+      <p class="note">
+        Note: prayers you shared into a group remain visible to the other members of that group,
+        as they belong to the shared group rather than to your personal account. Your personal
+        account and personal data are fully removed.
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>Data retention</h2>
+      <p class="note">
+        After deletion, your data is removed from our active systems. Limited records may persist
+        briefly in encrypted backups before being overwritten on our normal backup-rotation schedule.
+        We do not retain personal data longer than required for legal or operational obligations.
+      </p>
+    </div>
+
+    <footer>
+      Questions? Contact <a href="mailto:support@prayerloop.io">support@prayerloop.io</a><br />
+      See also our <a href="/privacy">Privacy Policy</a>.
+    </footer>
+  </div>
+</body>
+</html>
