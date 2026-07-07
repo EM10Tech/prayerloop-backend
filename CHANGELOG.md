@@ -6,6 +6,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project uses a date-based versioning scheme: `[year].[month].[sequence]`
 (e.g., 2025.11.3 is the third release in November 2025).
 
+## [Unreleased]
+
+### Added
+
+- **Planning Center OAuth login with email-collision interstitial** (Phase 1, planning doc §D/§H/§I)
+  - `POST /auth/oauth/:provider/login` - Backend-mediated PKCE code exchange
+    (confidential client holds `PC_CLIENT_SECRET`), identity fetch via OIDC
+    userinfo, then: returning identity → login; email collision → pending
+    link (below); new user → auto-create + link in a transaction (with
+    concurrent-duplicate recovery on `UNIQUE(provider, provider_user_id)`)
+  - **Email-collision pending-link mechanism** - an OAuth login whose email
+    matches an existing `user_profile` is NEVER silently merged (Planning
+    Center has no `email_verified` claim; email is not an identity key).
+    Instead a single-use, 10-minute `oauth_pending_link` record (verified
+    sub + AES-256-GCM-encrypted provider tokens, keyed by sha256 of a
+    one-time token) is stored and a structured `409 OAUTH_EMAIL_COLLISION`
+    error with `pendingLinkToken` is returned for the mobile interstitial
+  - `POST /auth/oauth/:provider/confirm-link` - Completes the interstitial:
+    verifies the pending-link token + the account's existing password
+    (max 3 attempts), atomically consumes the record, inserts the
+    `user_external_identity` link, and issues a prayerloop JWT
+  - `services/oauthService.go` - Provider registry + `PlanningCenterProvider`
+    (token exchange, userinfo); provider-parameterized so Google/Apple reuse
+    the same endpoints
+  - `services/crypto.go` - AES-256-GCM encrypt/decrypt for provider tokens at
+    rest, keyed by new `OAUTH_TOKEN_ENC_KEY` env var (separate from JWT
+    `SECRET`; stdlib only). Missing key degrades to not storing tokens
+  - New env vars: `PC_CLIENT_ID`, `PC_CLIENT_SECRET`, `OAUTH_TOKEN_ENC_KEY`
+
+### Changed
+
+- **`UserProfile.Password` is now `*string`** (schema migration 026 makes the
+  column nullable). `POST /login` rejects NULL-password (OAuth-only) accounts
+  with a "sign in with your provider" 401; a NULL password never matches
+- **JWT issuance extracted to `generateAccessToken`** (`controllers/authHelpers.go`)
+  - single source shared by password login, OAuth login, and confirm-link;
+  token shape (`{id, exp, role}`) unchanged, `CheckAuth` unaffected
+- **`PATCH /users/:id/password`** skips the old-password check when the
+  account has no password, giving OAuth-only users a set-first-password path
+- **`DELETE /users/:id/account`** deletion sequence now includes
+  `user_external_identity`, `oauth_pending_link`, and `auth_refresh_token`
+
 ## [2026.2.1] - 2026-02-06
 
 ### Added

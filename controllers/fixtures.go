@@ -33,10 +33,11 @@ func MockUserWithPassword() models.UserProfile {
 	phone := "1234567890"
 	// Pre-hashed password for "password123"
 	hashedPassword, _ := bcrypt.GenerateFromPassword([]byte("password123"), bcrypt.DefaultCost)
+	hashedPasswordStr := string(hashedPassword)
 	return models.UserProfile{
 		User_Profile_ID: 1,
 		Username:        "testuser",
-		Password:        string(hashedPassword),
+		Password:        &hashedPasswordStr,
 		First_Name:      "Test",
 		Last_Name:       "User",
 		Email:           "test@example.com",
@@ -73,10 +74,11 @@ func MockAdminUserWithPassword() models.UserProfile {
 	phone := "9876543210"
 	// Pre-hashed password for "admin123"
 	hashedPassword, _ := bcrypt.GenerateFromPassword([]byte("admin123"), bcrypt.DefaultCost)
+	hashedPasswordStr := string(hashedPassword)
 	return models.UserProfile{
 		User_Profile_ID: 2,
 		Username:        "adminuser",
-		Password:        string(hashedPassword),
+		Password:        &hashedPasswordStr,
 		First_Name:      "Admin",
 		Last_Name:       "User",
 		Email:           "admin@example.com",

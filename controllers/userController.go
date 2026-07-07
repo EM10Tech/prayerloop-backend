@@ -7,11 +7,9 @@ import (
 	"strconv"
 	"strings"
 
-	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v4"
 
 	"github.com/PrayerLoop/initializers"
 	"github.com/PrayerLoop/models"
@@ -93,9 +91,11 @@ func PublicUserSignup(c *gin.Context) {
 		phoneNumber = &user.Phone_Number
 	}
 
+	passwordHashStr := string(passwordHash)
+
 	newUser := models.UserProfile{
 		Username:     user.Username,
-		Password:     string(passwordHash),
+		Password:     &passwordHashStr,
 		Email:        user.Email,
 		First_Name:   user.First_Name,
 		Last_Name:    user.Last_Name,
@@ -194,9 +194,11 @@ func UserSignup(c *gin.Context) {
 		phoneNumber = &user.Phone_Number
 	}
 
+	passwordHashStr := string(passwordHash)
+
 	newUser := models.UserProfile{
 		Username:     user.Username,
-		Password:     string(passwordHash),
+		Password:     &passwordHashStr,
 		Email:        user.Email,
 		First_Name:   user.First_Name,
 		Last_Name:    user.Last_Name,
@@ -298,27 +300,20 @@ func UserLogin(c *gin.Context) {
 		return
 	}
 
-	err = bcrypt.CompareHashAndPassword([]byte(dbUser.Password), []byte(user.Password))
+	// OAuth-only accounts have a NULL password: password login is unavailable,
+	// and a NULL hash must never authenticate.
+	if dbUser.Password == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "This account uses social login. Sign in with your provider or set a password via 'Forgot Password'."})
+		return
+	}
+
+	err = bcrypt.CompareHashAndPassword([]byte(*dbUser.Password), []byte(user.Password))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
 
-	role := ""
-	if dbUser.Admin {
-		role = "admin"
-	} else {
-		role = "user"
-	}
-
-	generateToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"id":   dbUser.User_Profile_ID,
-		"exp":  time.Now().Add(time.Hour * 24).Unix(),
-		"role": role,
-	})
-
-	token, err := generateToken.SignedString([]byte(os.Getenv("SECRET")))
-
+	token, err := generateAccessToken(dbUser)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to generate token", "details": err.Error()})
 	}
@@ -1206,9 +1201,11 @@ func ChangeUserPassword(c *gin.Context) {
 		return
 	}
 
-	// Verify old password (unless admin is changing another user's password)
-	if userID == currentUser.User_Profile_ID {
-		err = bcrypt.CompareHashAndPassword([]byte(existingUser.Password), []byte(passwordChange.Old_Password))
+	// Verify old password (unless admin is changing another user's password).
+	// OAuth-only accounts (NULL password) skip the check so they can set a
+	// first password — the JWT already proves account ownership.
+	if userID == currentUser.User_Profile_ID && existingUser.Password != nil {
+		err = bcrypt.CompareHashAndPassword([]byte(*existingUser.Password), []byte(passwordChange.Old_Password))
 		if err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Current password is incorrect"})
 			return
@@ -1507,6 +1504,17 @@ func DeleteUserAccount(c *gin.Context) {
 		log.Printf("Failed to delete password_reset_tokens: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete password reset tokens", "details": err.Error()})
 		return
+	}
+
+	// 2b. Delete OAuth identity links, pending links, and refresh tokens
+	// (optional tables — added by migrations 026/027)
+	for _, table := range []string{"user_external_identity", "oauth_pending_link", "auth_refresh_token"} {
+		err = safeDeleteOptional(table, goqu.C("user_profile_id").Eq(userID))
+		if err != nil {
+			log.Printf("Failed to delete %s: %v", table, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete OAuth account data", "details": err.Error()})
+			return
+		}
 	}
 
 	// 3. Delete prayer session details (must delete BEFORE prayer_session due to FK)

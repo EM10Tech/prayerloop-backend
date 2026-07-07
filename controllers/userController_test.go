@@ -870,6 +870,12 @@ func TestDeleteUserAccount(t *testing.T) {
 					// 2. password_reset_tokens (optional)
 					mock.ExpectExec("DELETE").WillReturnResult(sqlmock.NewResult(0, 0))
 
+					// 2b. user_external_identity, oauth_pending_link,
+					// auth_refresh_token (optional)
+					mock.ExpectExec("DELETE").WillReturnResult(sqlmock.NewResult(0, 0))
+					mock.ExpectExec("DELETE").WillReturnResult(sqlmock.NewResult(0, 0))
+					mock.ExpectExec("DELETE").WillReturnResult(sqlmock.NewResult(0, 0))
+
 					// 3. prayer_session_detail (via subquery)
 					mock.ExpectExec("DELETE").WillReturnResult(sqlmock.NewResult(0, 0))
 

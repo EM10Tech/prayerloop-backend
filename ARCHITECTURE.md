@@ -40,7 +40,7 @@ services/                       Side-effect helpers reused across controllers:
 
 ## Routing Surface (`main.go`)
 
-- **Public:** `/login`, `/signup`, `/check-username`, `/ping`, `/auth/forgot-password`, `/auth/verify-reset-code`, `/auth/reset-password`, `/privacy`, `/static/*`.
+- **Public:** `/login`, `/signup`, `/check-username`, `/ping`, `/auth/forgot-password`, `/auth/verify-reset-code`, `/auth/reset-password`, `/auth/oauth/:provider/login`, `/auth/oauth/:provider/confirm-link`, `/privacy`, `/static/*`.
 - **Authenticated** (`auth` group, `CheckAuth` + 10 rps rate limit): users, groups, prayers, prayer subjects, categories, comments, notifications, connection requests, prayer analytics, push-token registration.
 - **Admin** (`admin` group, `CheckAdmin` + 5 rps): cross-tenant prayer reads, internal user creation, broadcast push.
 

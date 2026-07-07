@@ -5,7 +5,7 @@ import "time"
 type UserProfile struct {
 	User_Profile_ID    int       `json:"userProfileId" goqu:"skipinsert"`
 	Username           string    `json:"username"`
-	Password           string    `json:"-"`
+	Password           *string   `json:"-"` // NULL for OAuth-only accounts; treat nil as "password login unavailable"
 	Email              string    `json:"email"`
 	First_Name         string    `json:"firstName"`
 	Last_Name          string    `json:"lastName"`

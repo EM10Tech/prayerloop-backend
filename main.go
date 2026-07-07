@@ -16,6 +16,7 @@ func init() {
 	initializers.ConnectDB()
 	services.InitPushNotificationService()
 	services.InitEmailService()
+	services.InitOAuthService()
 }
 
 func main() {
@@ -45,6 +46,10 @@ func main() {
 	router.POST("/auth/forgot-password", middlewares.RateLimitMiddleware(2, 2, getKey), controllers.ForgotPassword)
 	router.POST("/auth/verify-reset-code", middlewares.RateLimitMiddleware(5, 5, getKey), controllers.VerifyResetCode)
 	router.POST("/auth/reset-password", middlewares.RateLimitMiddleware(2, 2, getKey), controllers.ResetPassword)
+
+	// OAuth endpoints (provider-parameterized: planning_center now, google/apple later)
+	router.POST("/auth/oauth/:provider/login", middlewares.RateLimitMiddleware(2, 2, getKey), controllers.OAuthLogin)
+	router.POST("/auth/oauth/:provider/confirm-link", middlewares.RateLimitMiddleware(2, 2, getKey), controllers.OAuthConfirmLink)
 
 	// Test endpoint for email service (remove in production)
 	router.POST("/test/email", middlewares.RateLimitMiddleware(2, 2, getKey), controllers.TestEmailService)
