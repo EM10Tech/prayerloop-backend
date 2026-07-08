@@ -43,7 +43,7 @@ func (m *mockProvider) ExchangeCode(ctx context.Context, code, redirectURI, code
 	return m.tokens, nil
 }
 
-func (m *mockProvider) FetchIdentity(ctx context.Context, accessToken string) (*services.ProviderIdentity, error) {
+func (m *mockProvider) FetchIdentity(ctx context.Context, tokens *services.ProviderTokens) (*services.ProviderIdentity, error) {
 	if m.identityErr != nil {
 		return nil, m.identityErr
 	}

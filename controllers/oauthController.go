@@ -59,7 +59,7 @@ func OAuthLogin(c *gin.Context) {
 		return
 	}
 
-	identity, err := provider.FetchIdentity(c.Request.Context(), tokens.AccessToken)
+	identity, err := provider.FetchIdentity(c.Request.Context(), tokens)
 	if err != nil {
 		log.Printf("OAuth %s identity fetch failed: %v", provider.Name(), err)
 		c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to fetch identity from provider"})
