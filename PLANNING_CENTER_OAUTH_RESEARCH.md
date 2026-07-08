@@ -589,3 +589,61 @@ The Phase 0/Phase 1 code shipped on this branch (`controllers/oauthController.go
 3. `AppleProvider` (id_token/JWKS verification path) if not already done in step 2.
 4. Linking/unlinking (Scenario 2/4), now covering all three providers.
 5. §L.3 church-connection idea — revisit only if/when church-specific distribution becomes a priority again.
+
+---
+
+## N. 2026-07-08 addendum — project board audit (prayerloop-backend issues #33–39)
+
+Pulled the `prayerloop` org project (EM10Tech, project #1) and reconciled its "Not started" column against what's actually in the codebase. Backend OAuth work is tracked as issues **#33–39** (all `oauth-integration` label); mobile has its own parallel set (not audited here — different repo).
+
+### N.1 Findings at audit time
+
+| # | Title | Board column (before) | Actual code state |
+|---|---|---|---|
+| #33 | `[P0] Email-collision interstitial + pending-link mechanism` | Testing | Shipped (`createPendingLink`/`OAuthConfirmLink`) — matches. |
+| #34 | `[P0] Transaction safety + idempotent OAuth auto-create` | In Process | Satisfied by the uncommitted diff at the time (self-subject creation moved inside the `createOAuthUser` transaction, username/email-race recovery, fail-closed on unrelated races, opt-in real-DB race integration test). Refresh-token issuance — listed in the issue's transaction step list — intentionally **not** included; it doesn't exist yet anywhere in the codebase (tracked under #36). Diff was committed against this issue. |
+| #35 | `[P0] Integrate OAuth tables into DeleteUserAccount + token revocation` | Not started | **Half done.** `DeleteUserAccount` (`controllers/userController.go:1509-1518`) already deletes `user_external_identity`/`oauth_pending_link`/`auth_refresh_token` rows. **Token revocation is not implemented** — see N.2. |
+| #36 | `[Phase 0] Auth foundation: Password *string refactor, authHelpers.go, refresh/logout endpoints` | Not started | **Half done.** `Password *string` (models/userProfile.go) and `controllers/authHelpers.go` (`generateAccessToken`) both shipped and in use. **`/auth/refresh` and `/auth/logout` do not exist** — no route, no issuance/rotation code, no `models/authToken.go`. See N.3. |
+| #37 | `[Phase 1] PCO OAuth service + OAuthLogin endpoint (scenarios 1 & 3)` | Not started | **Fully shipped** (`services/oauthService.go`, `controllers.OAuthLogin`) — stale card. **Moved to Testing** (2026-07-08) for a second dev to verify. |
+| #38 | `[Phase 2] OAuthLink, OAuthUnlink, ListUserIdentities + set-password endpoint` | Not started | Correctly not started — none of this exists. |
+| #39 | `[Phase 3] Google + Apple OAuth provider implementations` | Not started | Correctly not started — none of this exists. Per §M this is now the **next priority** once #35/#36 close out the remaining Phase 0 gaps. |
+
+Takeaway: the board undercounted progress on #35/#36/#37 — normal drift from committing work without moving cards. #35 and #36 are judged small remaining effort (see below) and are being picked up next; that leaves **#38 and #39** as the actual backend backlog, plus the parallel mobile-side cards in the other repo.
+
+### N.2 #35 remaining scope — token revocation
+
+Not yet in the codebase:
+- `OAuthProvider` interface (`services/oauthService.go`) has no `Revoke` method — only `Name`/`ExchangeCode`/`FetchIdentity` exist today.
+- Add `Revoke(ctx context.Context, token string) error` to the interface; implement for `PlanningCenterProvider` as a `POST` to `https://api.planningcenteronline.com/oauth/revoke` (RFC 7009 — see §G; unverified whether PCO's discovery doc actually advertises `revocation_endpoint`, confirm before relying on it, but the URL itself is documented).
+- In `DeleteUserAccount`, **before** the existing best-effort delete of `user_external_identity` rows (`userController.go:1509-1518`): for each identity row belonging to the user, decrypt its stored `access_token`/`refresh_token` (`services.DecryptToken`, `services/crypto.go`) and call `Revoke` best-effort (log-and-continue on failure — a dead revoke must never block account deletion, matching the existing `safeDeleteOptional` posture). Rows with no stored tokens (encryption was unavailable at link time) are skipped.
+- Apple mandates revoke-on-delete (§H.10); doing this generically now means Google/Apple get it for free once #39 lands.
+
+### N.3 #36 remaining scope — refresh/logout endpoints
+
+Not yet in the codebase:
+- `models/authToken.go` — `AuthRefreshToken` struct + `RefreshTokenRequest` (referenced in §D's file plan but never created).
+- `issueRefreshToken(userID)` / `validateAndRotateRefreshToken(plaintext)` helpers (§D: 32 random bytes, store `sha256(token)`, rotate-on-use, detect reuse of a revoked token as theft signal).
+- `POST /auth/refresh`, `POST /auth/logout` routes + handlers (`main.go` currently only has the two `/auth/oauth/:provider/*` routes from #33/#34/#37 — no refresh/logout routes at all).
+- Wire `issueRefreshToken` into the existing login paths (`UserLogin`, `OAuthLogin`, `OAuthConfirmLink`) so every successful auth returns `{token, refreshToken, user}` — none of the current responses include a `refreshToken` field yet (confirmed: `respondWithSession` in `oauthController.go` returns only `token`).
+- **Dependency to verify first:** confirm the `auth_refresh_token` table migration has actually landed in `prayerloop-psql` — `DeleteUserAccount`'s reference to it (`userController.go:1511`) is defensive (`safeDeleteOptional` silently no-ops on "relation does not exist"), so its presence hasn't been confirmed from this repo alone.
+- This is the harder blocker flagged in §M.3: Google/Apple mobile launch needs this (no password to replay for re-login), so closing it now directly unblocks #39.
+
+### N.4 Updated near-term order (backend)
+
+1. #35 (token revocation) and #36 (refresh/logout) — small remaining scope, being picked up next.
+2. #39 (Google + Apple provider implementations) — next priority per §M, unblocked once #36 ships.
+3. #38 (link/unlink) — provider-agnostic, can land before or after #39.
+4. Mobile-side equivalents (separate repo, not audited here).
+
+---
+
+## O. 2026-07-08 addendum — #35 and #36 shipped
+
+Both remaining Phase 0 gaps identified in §N.2/§N.3 are now implemented:
+
+- **#35 (token revocation):** `OAuthProvider` gained a `Revoke(ctx, token) error` method (`services/oauthService.go`); `PlanningCenterProvider.Revoke` POSTs to PCO's `/oauth/revoke` (RFC 7009), treating any non-200 as a failure. `DeleteUserAccount` (`controllers/userController.go`) now calls a new `revokeIdentityTokens` helper (`controllers/oauthController.go`) immediately before the existing `user_external_identity`/`oauth_pending_link`/`auth_refresh_token` delete loop: it loads the user's identity rows, decrypts the stored refresh token (falling back to the access token if no refresh token was stored) via `services.DecryptToken`, and calls `Revoke` best-effort — any failure (missing provider, decrypt error, HTTP failure) is logged and swallowed so deletion is never blocked.
+- **#36 (refresh/logout endpoints):** Added `models/authToken.go` (`AuthRefreshToken`, `RefreshTokenRequest`). `controllers/authHelpers.go` gained `issueRefreshToken`, `validateAndRotateRefreshToken` (rotate-on-use; presenting an already-revoked token revokes its entire `family_id` as a theft signal), and `revokeRefreshToken` (idempotent). New routes `POST /auth/refresh` → `RefreshAccessToken` and `POST /auth/logout` → `RevokeRefreshToken` (both in `oauthController.go`, registered as public routes in `main.go` alongside the OAuth endpoints). `UserLogin`, `OAuthLogin`, and `OAuthConfirmLink` (via the shared `respondWithSession`) now all issue a refresh token on successful auth and include it as `refreshToken` in the response — issuance failure is logged and non-fatal, never blocking an otherwise-successful login. `REFRESH_TOKEN_TTL_DAYS` (default 90) added to `.env`/`.env.example`, alongside documenting the previously-undocumented `PC_CLIENT_ID`/`PC_CLIENT_SECRET`/`OAUTH_TOKEN_ENC_KEY` vars in `.env.example`.
+
+Test coverage added: `services/oauthService_test.go` (Revoke success/empty-token/non-200 cases against an `httptest` server), `controllers/authHelpers_test.go` (issue/rotate/reuse-detection/logout unit tests against `sqlmock`), and new cases in `controllers/oauthController_test.go` (`revokeIdentityTokens` decrypt/fallback/skip/failure-survival, `RefreshAccessToken`/`RevokeRefreshToken` handlers). `go build ./...`, `go vet ./...`, and `go test ./... -race` all pass.
+
+Per §N.4, **#39 (Google + Apple provider implementations) is next**, followed by #38 (link/unlink) — both now unblocked.

@@ -51,6 +51,10 @@ func main() {
 	router.POST("/auth/oauth/:provider/login", middlewares.RateLimitMiddleware(2, 2, getKey), controllers.OAuthLogin)
 	router.POST("/auth/oauth/:provider/confirm-link", middlewares.RateLimitMiddleware(2, 2, getKey), controllers.OAuthConfirmLink)
 
+	// Server-side refresh tokens (shared by password and OAuth logins)
+	router.POST("/auth/refresh", middlewares.RateLimitMiddleware(5, 5, getKey), controllers.RefreshAccessToken)
+	router.POST("/auth/logout", middlewares.RateLimitMiddleware(5, 5, getKey), controllers.RevokeRefreshToken)
+
 	// Test endpoint for email service (remove in production)
 	router.POST("/test/email", middlewares.RateLimitMiddleware(2, 2, getKey), controllers.TestEmailService)
 

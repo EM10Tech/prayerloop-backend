@@ -40,6 +40,10 @@ type OAuthProvider interface {
 	Name() string
 	ExchangeCode(ctx context.Context, code, redirectURI, codeVerifier string) (*ProviderTokens, error)
 	FetchIdentity(ctx context.Context, accessToken string) (*ProviderIdentity, error)
+	// Revoke invalidates a provider token (RFC 7009). Called best-effort on
+	// unlink/account-deletion — callers must not let a Revoke failure block
+	// the delete/unlink itself.
+	Revoke(ctx context.Context, token string) error
 }
 
 var oauthProviders = map[string]OAuthProvider{}
@@ -64,6 +68,7 @@ func InitOAuthService() {
 		ClientSecret: clientSecret,
 		TokenURL:     "https://api.planningcenteronline.com/oauth/token",
 		UserInfoURL:  "https://api.planningcenteronline.com/oauth/userinfo",
+		RevokeURL:    "https://api.planningcenteronline.com/oauth/revoke",
 		HTTPClient:   &http.Client{Timeout: 15 * time.Second},
 	})
 	log.Println("Planning Center OAuth provider initialized")
@@ -104,6 +109,7 @@ type PlanningCenterProvider struct {
 	ClientSecret string
 	TokenURL     string
 	UserInfoURL  string
+	RevokeURL    string
 	HTTPClient   *http.Client
 }
 
@@ -226,6 +232,38 @@ func (p *PlanningCenterProvider) FetchIdentity(ctx context.Context, accessToken 
 		}
 	}
 	return identity, nil
+}
+
+// Revoke invalidates a Planning Center token via RFC 7009. Per the spec, the
+// endpoint returns 200 even for an already-invalid/unknown token — only a
+// non-200 response (or a request/network failure) is treated as an error.
+func (p *PlanningCenterProvider) Revoke(ctx context.Context, token string) error {
+	if token == "" {
+		return nil
+	}
+
+	form := url.Values{
+		"token":         {token},
+		"client_id":     {p.ClientID},
+		"client_secret": {p.ClientSecret},
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.RevokeURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := p.HTTPClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("revoke request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("revoke failed with status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // flexString unmarshals a JSON string, number, or null into a string.

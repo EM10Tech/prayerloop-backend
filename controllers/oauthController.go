@@ -1,6 +1,7 @@
 package controllers
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -286,8 +287,9 @@ func OAuthConfirmLink(c *gin.Context) {
 	respondWithSession(c, user, "Account linked successfully.")
 }
 
-// respondWithSession issues the standard prayerloop JWT response shared by
-// all successful auth paths.
+// respondWithSession issues the standard prayerloop JWT + refresh token
+// response shared by all successful auth paths. Refresh-token issuance is
+// best-effort: a failure there must not fail an otherwise-successful login.
 func respondWithSession(c *gin.Context, user models.UserProfile, message string) {
 	token, err := generateAccessToken(user)
 	if err != nil {
@@ -295,10 +297,16 @@ func respondWithSession(c *gin.Context, user models.UserProfile, message string)
 		return
 	}
 
+	refreshToken, err := issueRefreshToken(user.User_Profile_ID, "")
+	if err != nil {
+		log.Printf("Failed to issue refresh token for user %d: %v", user.User_Profile_ID, err)
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"message": message,
-		"token":   token,
-		"user":    user,
+		"message":      message,
+		"token":        token,
+		"refreshToken": refreshToken,
+		"user":         user,
 	})
 }
 
@@ -581,4 +589,115 @@ func uniqueViolation(err error) (string, bool) {
 		return pqErr.Constraint, true
 	}
 	return "", false
+}
+
+// revokeIdentityTokens best-effort revokes every OAuth provider token linked
+// to userID. Called by DeleteUserAccount before it deletes the
+// user_external_identity rows below — Apple mandates revoke-on-delete, and
+// doing this generically means Google/Apple get it for free once those
+// providers ship. A failed or unavailable revoke must never block account
+// deletion, so every error here is logged and swallowed.
+func revokeIdentityTokens(ctx context.Context, userID int) {
+	var identities []models.UserExternalIdentity
+	if err := initializers.DB.From("user_external_identity").
+		Select("*").
+		Where(goqu.C("user_profile_id").Eq(userID)).
+		ScanStructs(&identities); err != nil {
+		if !strings.Contains(err.Error(), "does not exist") {
+			log.Printf("Failed to load external identities for revocation (user %d): %v", userID, err)
+		}
+		return
+	}
+
+	for _, identity := range identities {
+		provider, ok := services.GetOAuthProvider(identity.Provider)
+		if !ok {
+			continue
+		}
+
+		// Revoking the refresh token invalidates the whole grant; fall back
+		// to the access token if no refresh token was stored.
+		encrypted := identity.Refresh_Token
+		if encrypted == nil || *encrypted == "" {
+			encrypted = identity.Access_Token
+		}
+		if encrypted == nil || *encrypted == "" {
+			continue
+		}
+
+		plaintext, err := services.DecryptToken(*encrypted)
+		if err != nil {
+			log.Printf("Failed to decrypt %s token for revocation (identity %d): %v",
+				identity.Provider, identity.User_External_Identity_ID, err)
+			continue
+		}
+
+		if err := provider.Revoke(ctx, plaintext); err != nil {
+			log.Printf("Best-effort revoke failed for %s identity %d: %v",
+				identity.Provider, identity.User_External_Identity_ID, err)
+		}
+	}
+}
+
+// RefreshAccessToken handles POST /auth/refresh. It validates and rotates a
+// presented prayerloop refresh token, returning a fresh JWT + refresh token
+// pair. Reuse of an already-rotated/revoked token revokes its entire family
+// (theft resistance) and is rejected.
+func RefreshAccessToken(c *gin.Context) {
+	var req models.RefreshTokenRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "refreshToken is required", "details": err.Error()})
+		return
+	}
+
+	record, newRefreshToken, err := validateAndRotateRefreshToken(req.RefreshToken)
+	if err != nil {
+		if errors.Is(err, errInvalidRefreshToken) || errors.Is(err, errRefreshTokenReused) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired refresh token"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to refresh session", "details": err.Error()})
+		return
+	}
+
+	var user models.UserProfile
+	found, err := initializers.DB.From("user_profile").
+		Select("*").
+		Where(goqu.C("user_profile_id").Eq(record.User_Profile_ID)).
+		ScanStruct(&user)
+	if err != nil || !found {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired refresh token"})
+		return
+	}
+
+	token, err := generateAccessToken(user)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token", "details": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"token":        token,
+		"refreshToken": newRefreshToken,
+		"user":         user,
+	})
+}
+
+// RevokeRefreshToken handles POST /auth/logout. It revokes the presented
+// refresh token; unknown/already-revoked tokens are treated as success so
+// logout is idempotent. The JWT itself remains valid until its natural
+// expiry (<=24h) — "log out all devices" is not yet supported.
+func RevokeRefreshToken(c *gin.Context) {
+	var req models.RefreshTokenRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "refreshToken is required", "details": err.Error()})
+		return
+	}
+
+	if err := revokeRefreshToken(req.RefreshToken); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to log out", "details": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Logged out successfully."})
 }

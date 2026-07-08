@@ -318,10 +318,16 @@ func UserLogin(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to generate token", "details": err.Error()})
 	}
 
+	refreshToken, err := issueRefreshToken(dbUser.User_Profile_ID, "")
+	if err != nil {
+		log.Printf("Failed to issue refresh token for user %d: %v", dbUser.User_Profile_ID, err)
+	}
+
 	c.JSON(200, gin.H{
-		"message": "User logged in successfully.",
-		"token":   token,
-		"user":    dbUser,
+		"message":      "User logged in successfully.",
+		"token":        token,
+		"refreshToken": refreshToken,
+		"user":         dbUser,
 	})
 }
 
@@ -1506,7 +1512,12 @@ func DeleteUserAccount(c *gin.Context) {
 		return
 	}
 
-	// 2b. Delete OAuth identity links, pending links, and refresh tokens
+	// 2b. Revoke any linked OAuth provider tokens before the identity rows
+	// below are deleted (Apple mandates revoke-on-account-delete). This is
+	// best-effort by design — a failed revoke must never block deletion.
+	revokeIdentityTokens(c.Request.Context(), userID)
+
+	// 2c. Delete OAuth identity links, pending links, and refresh tokens
 	// (optional tables — added by migrations 026/027)
 	for _, table := range []string{"user_external_identity", "oauth_pending_link", "auth_refresh_token"} {
 		err = safeDeleteOptional(table, goqu.C("user_profile_id").Eq(userID))

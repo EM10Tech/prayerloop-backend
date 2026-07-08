@@ -3,9 +3,13 @@ package controllers
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 	"time"
 
@@ -26,6 +30,8 @@ type mockProvider struct {
 	exchangeErr error
 	identity    *services.ProviderIdentity
 	identityErr error
+	revokeErr   error
+	revoked     []string
 }
 
 func (m *mockProvider) Name() string { return m.name }
@@ -42,6 +48,11 @@ func (m *mockProvider) FetchIdentity(ctx context.Context, accessToken string) (*
 		return nil, m.identityErr
 	}
 	return m.identity, nil
+}
+
+func (m *mockProvider) Revoke(ctx context.Context, token string) error {
+	m.revoked = append(m.revoked, token)
+	return m.revokeErr
 }
 
 func registerMockProvider(t *testing.T, p *mockProvider) {
@@ -515,5 +526,179 @@ func TestOAuthConfirmLinkIdentityTakenByAnotherAccount(t *testing.T) {
 	OAuthConfirmLink(c)
 
 	assert.Equal(t, http.StatusConflict, w.Code)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// setTestTokenCryptoKey installs a random AES-256-GCM key for the duration
+// of the test so services.EncryptToken/DecryptToken are usable.
+func setTestTokenCryptoKey(t *testing.T) {
+	t.Helper()
+	key := make([]byte, 32)
+	_, err := rand.Read(key)
+	require.NoError(t, err)
+	t.Setenv("OAUTH_TOKEN_ENC_KEY", base64.StdEncoding.EncodeToString(key))
+	require.NoError(t, services.InitTokenCrypto())
+	t.Cleanup(func() {
+		os.Unsetenv("OAUTH_TOKEN_ENC_KEY")
+		_ = services.InitTokenCrypto()
+	})
+}
+
+func TestRevokeIdentityTokensCallsProviderRevokeWithDecryptedToken(t *testing.T) {
+	setTestTokenCryptoKey(t)
+
+	plainRefresh := "pco-refresh-token-plaintext"
+	encRefresh, err := services.EncryptToken(plainRefresh)
+	require.NoError(t, err)
+
+	mp := &mockProvider{name: "planning_center"}
+	registerMockProvider(t, mp)
+
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	rows := sqlmock.NewRows(externalIdentityColumns()).AddRow(
+		1, 42, "planning_center", "pco_sub_1", nil, nil, &encRefresh, nil, nil, nil,
+		time.Now(), time.Now(),
+	)
+	mock.ExpectQuery("SELECT").WillReturnRows(rows)
+
+	revokeIdentityTokens(context.Background(), 42)
+
+	require.Len(t, mp.revoked, 1)
+	assert.Equal(t, plainRefresh, mp.revoked[0])
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRevokeIdentityTokensFallsBackToAccessToken(t *testing.T) {
+	setTestTokenCryptoKey(t)
+
+	plainAccess, err := services.EncryptToken("pco-access-token-plaintext")
+	require.NoError(t, err)
+
+	mp := &mockProvider{name: "planning_center"}
+	registerMockProvider(t, mp)
+
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	// No refresh_token stored, only access_token.
+	rows := sqlmock.NewRows(externalIdentityColumns()).AddRow(
+		1, 42, "planning_center", "pco_sub_1", nil, &plainAccess, nil, nil, nil, nil,
+		time.Now(), time.Now(),
+	)
+	mock.ExpectQuery("SELECT").WillReturnRows(rows)
+
+	revokeIdentityTokens(context.Background(), 42)
+
+	require.Len(t, mp.revoked, 1)
+	assert.Equal(t, "pco-access-token-plaintext", mp.revoked[0])
+}
+
+func TestRevokeIdentityTokensSkipsUnregisteredProviderAndNoTokens(t *testing.T) {
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	rows := sqlmock.NewRows(externalIdentityColumns()).AddRow(
+		1, 42, "google", "google_sub_1", nil, nil, nil, nil, nil, nil,
+		time.Now(), time.Now(),
+	)
+	mock.ExpectQuery("SELECT").WillReturnRows(rows)
+
+	// Should not panic and should simply skip: no registered "google"
+	// provider yet, and no tokens stored either.
+	revokeIdentityTokens(context.Background(), 42)
+
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRevokeIdentityTokensSurvivesRevokeFailure(t *testing.T) {
+	setTestTokenCryptoKey(t)
+
+	encRefresh, err := services.EncryptToken("pco-refresh-token")
+	require.NoError(t, err)
+
+	mp := &mockProvider{name: "planning_center", revokeErr: fmt.Errorf("revoke endpoint unreachable")}
+	registerMockProvider(t, mp)
+
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	rows := sqlmock.NewRows(externalIdentityColumns()).AddRow(
+		1, 42, "planning_center", "pco_sub_1", nil, nil, &encRefresh, nil, nil, nil,
+		time.Now(), time.Now(),
+	)
+	mock.ExpectQuery("SELECT").WillReturnRows(rows)
+
+	// Must not panic even though Revoke fails — best-effort by design.
+	assert.NotPanics(t, func() {
+		revokeIdentityTokens(context.Background(), 42)
+	})
+	require.Len(t, mp.revoked, 1)
+}
+
+func TestRefreshAccessTokenSuccess(t *testing.T) {
+	os.Setenv("SECRET", "test-secret-key")
+	defer os.Unsetenv("SECRET")
+
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	plaintext := "presented-refresh-token"
+	hash := hashRefreshToken(plaintext)
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows(authRefreshTokenColumns()).AddRow(
+		1, 1, hash, "family-1", time.Now().Add(24*time.Hour), false, nil, time.Now(),
+	))
+	mock.ExpectExec(`UPDATE "auth_refresh_token"`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`INSERT INTO "auth_refresh_token"`).WillReturnResult(sqlmock.NewResult(2, 1))
+	mock.ExpectQuery("SELECT").WillReturnRows(userProfileRows(MockUser()))
+
+	c, w := SetupTestContext()
+	body, _ := json.Marshal(models.RefreshTokenRequest{RefreshToken: plaintext})
+	c.Request = httptest.NewRequest("POST", "/auth/refresh", bytes.NewBuffer(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	RefreshAccessToken(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var response map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.NotEmpty(t, response["token"])
+	assert.NotEmpty(t, response["refreshToken"])
+	assert.NotEqual(t, plaintext, response["refreshToken"])
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRefreshAccessTokenInvalid(t *testing.T) {
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows(authRefreshTokenColumns()))
+
+	c, w := SetupTestContext()
+	body, _ := json.Marshal(models.RefreshTokenRequest{RefreshToken: "unknown-token"})
+	c.Request = httptest.NewRequest("POST", "/auth/refresh", bytes.NewBuffer(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	RefreshAccessToken(c)
+
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestRevokeRefreshTokenHandlerSuccess(t *testing.T) {
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	mock.ExpectExec(`UPDATE "auth_refresh_token"`).WillReturnResult(sqlmock.NewResult(0, 1))
+
+	c, w := SetupTestContext()
+	body, _ := json.Marshal(models.RefreshTokenRequest{RefreshToken: "some-token"})
+	c.Request = httptest.NewRequest("POST", "/auth/logout", bytes.NewBuffer(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	RevokeRefreshToken(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }

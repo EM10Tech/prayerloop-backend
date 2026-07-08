@@ -870,7 +870,12 @@ func TestDeleteUserAccount(t *testing.T) {
 					// 2. password_reset_tokens (optional)
 					mock.ExpectExec("DELETE").WillReturnResult(sqlmock.NewResult(0, 0))
 
-					// 2b. user_external_identity, oauth_pending_link,
+					// 2b. best-effort provider-token revocation looks up any
+					// linked identities before they're deleted below (none
+					// for this fixture user).
+					mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows(externalIdentityColumns()))
+
+					// 2c. user_external_identity, oauth_pending_link,
 					// auth_refresh_token (optional)
 					mock.ExpectExec("DELETE").WillReturnResult(sqlmock.NewResult(0, 0))
 					mock.ExpectExec("DELETE").WillReturnResult(sqlmock.NewResult(0, 0))
