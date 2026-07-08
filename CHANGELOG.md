@@ -48,6 +48,19 @@ and this project uses a date-based versioning scheme: `[year].[month].[sequence]
 - **`DELETE /users/:id/account`** deletion sequence now includes
   `user_external_identity`, `oauth_pending_link`, and `auth_refresh_token`
 
+### Fixed
+
+- **OAuth auto-create is now fully transactional and idempotent under
+  concurrent double-tap** (planning doc §I.1 P0, §D step 5). The self
+  prayer_subject is created inside the same transaction as `user_profile` and
+  `user_external_identity` (no partial accounts), and a unique-constraint
+  violation on the `user_profile` INSERT — where the double-tap race actually
+  surfaces, since both requests synthesize the same username from the provider
+  sub — now recovers by re-looking-up the winner's `(provider, sub)` identity
+  and returning that account instead of a 500. An unrelated username/email
+  race (no linked identity) still fails closed rather than returning another
+  user's account. The welcome email stays outside the transaction by design
+
 ## [2026.2.1] - 2026-02-06
 
 ### Added

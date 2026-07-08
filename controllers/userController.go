@@ -1640,13 +1640,25 @@ func DeleteUserAccount(c *gin.Context) {
 	})
 }
 
+// selfSubjectDB is the subset of goqu operations getOrCreateSelfPrayerSubject
+// needs; both *goqu.Database and *goqu.TxDatabase satisfy it, so the subject
+// can be created inside a caller's transaction.
+type selfSubjectDB interface {
+	From(from ...interface{}) *goqu.SelectDataset
+	Insert(table interface{}) *goqu.InsertDataset
+}
+
 // GetOrCreateSelfPrayerSubject finds or creates a "self" prayer_subject for a user.
 // A "self" prayer_subject is one where the user is praying for themselves.
 // This is identified by: created_by = user_profile_id AND user_profile_id = user_profile_id (linked to self)
 func GetOrCreateSelfPrayerSubject(user models.UserProfile) (int, error) {
+	return getOrCreateSelfPrayerSubject(initializers.DB, user)
+}
+
+func getOrCreateSelfPrayerSubject(db selfSubjectDB, user models.UserProfile) (int, error) {
 	// First, try to find an existing "self" prayer_subject
 	var existingSubjectID int
-	found, err := initializers.DB.From("prayer_subject").
+	found, err := db.From("prayer_subject").
 		Select("prayer_subject_id").
 		Where(
 			goqu.And(
@@ -1684,7 +1696,7 @@ func GetOrCreateSelfPrayerSubject(user models.UserProfile) (int, error) {
 		Updated_By:                  user.User_Profile_ID,
 	}
 
-	insert := initializers.DB.Insert("prayer_subject").Rows(newSubject).Returning("prayer_subject_id")
+	insert := db.Insert("prayer_subject").Rows(newSubject).Returning("prayer_subject_id")
 
 	var insertedID int
 	_, err = insert.Executor().ScanVal(&insertedID)

@@ -210,18 +210,17 @@ func TestOAuthLoginAutoCreatesUser(t *testing.T) {
 	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows(userProfileTestColumns()))
 	// synthesizeUsername availability probe
 	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
-	// transactional create + link
+	// transactional create: user_profile + self prayer_subject + identity link
 	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO "user_profile"`).WillReturnRows(sqlmock.NewRows([]string{"user_profile_id"}).AddRow(42))
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"prayer_subject_id"}))
+	mock.ExpectQuery(`INSERT INTO "prayer_subject"`).WillReturnRows(sqlmock.NewRows([]string{"prayer_subject_id"}).AddRow(7))
 	mock.ExpectExec(`INSERT INTO "user_external_identity"`).WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 	// reload created user
 	createdUser := MockUser()
 	createdUser.User_Profile_ID = 42
 	mock.ExpectQuery("SELECT").WillReturnRows(userProfileRows(createdUser))
-	// GetOrCreateSelfPrayerSubject: no existing subject, then create
-	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"prayer_subject_id"}))
-	mock.ExpectQuery(`INSERT INTO "prayer_subject"`).WillReturnRows(sqlmock.NewRows([]string{"prayer_subject_id"}).AddRow(7))
 
 	c, w := oauthContext(t, "planningcenter", "/auth/oauth/planningcenter/login", validLoginBody())
 	OAuthLogin(c)
@@ -244,6 +243,8 @@ func TestOAuthLoginAutoCreateRecoversFromConcurrentDuplicate(t *testing.T) {
 	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 	mock.ExpectBegin()
 	mock.ExpectQuery(`INSERT INTO "user_profile"`).WillReturnRows(sqlmock.NewRows([]string{"user_profile_id"}).AddRow(42))
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"prayer_subject_id"}))
+	mock.ExpectQuery(`INSERT INTO "prayer_subject"`).WillReturnRows(sqlmock.NewRows([]string{"prayer_subject_id"}).AddRow(7))
 	// A concurrent request already linked this (provider, sub)
 	mock.ExpectExec(`INSERT INTO "user_external_identity"`).
 		WillReturnError(&pq.Error{Code: "23505", Constraint: "uq_uei_provider_user"})
@@ -260,6 +261,91 @@ func TestOAuthLoginAutoCreateRecoversFromConcurrentDuplicate(t *testing.T) {
 	OAuthLogin(c)
 
 	assert.Equal(t, http.StatusOK, w.Code)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestOAuthLoginAutoCreateRecoversFromUsernameRace covers the realistic
+// double-tap: both requests synthesize the identical username from the
+// provider sub, so the loser hits UNIQUE(username) on the user_profile INSERT
+// (before ever reaching the identity insert) and must recover by returning
+// the winner's account instead of a 500.
+func TestOAuthLoginAutoCreateRecoversFromUsernameRace(t *testing.T) {
+	registerMockProvider(t, defaultMockProvider())
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows(externalIdentityColumns()))
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows(userProfileTestColumns()))
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectBegin()
+	// The concurrent winner committed first and owns the synthesized username
+	mock.ExpectQuery(`INSERT INTO "user_profile"`).
+		WillReturnError(&pq.Error{Code: "23505", Constraint: "idx_user_profile_username"})
+	mock.ExpectRollback()
+	// Recovery: the winner linked the same (provider, sub) — return its user
+	identityRows := sqlmock.NewRows(externalIdentityColumns()).AddRow(
+		10, 1, "planning_center", "pco_sub_1", nil, nil, nil, nil, nil, nil,
+		time.Now(), time.Now(),
+	)
+	mock.ExpectQuery("SELECT").WillReturnRows(identityRows)
+	mock.ExpectQuery("SELECT").WillReturnRows(userProfileRows(MockUserWithPassword()))
+
+	c, w := oauthContext(t, "planningcenter", "/auth/oauth/planningcenter/login", validLoginBody())
+	OAuthLogin(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestOAuthLoginAutoCreateFailsClosedOnUnrelatedUniqueRace: a unique violation
+// on user_profile whose (provider, sub) has NOT been linked by anyone (e.g. an
+// email race with a plain signup) must NOT return some other user's account —
+// that would be a silent merge.
+func TestOAuthLoginAutoCreateFailsClosedOnUnrelatedUniqueRace(t *testing.T) {
+	registerMockProvider(t, defaultMockProvider())
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows(externalIdentityColumns()))
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows(userProfileTestColumns()))
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectBegin()
+	mock.ExpectQuery(`INSERT INTO "user_profile"`).
+		WillReturnError(&pq.Error{Code: "23505", Constraint: "idx_user_profile_email"})
+	mock.ExpectRollback()
+	// Recovery lookup finds no identity for (provider, sub) -> fail closed
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows(externalIdentityColumns()))
+
+	c, w := oauthContext(t, "planningcenter", "/auth/oauth/planningcenter/login", validLoginBody())
+	OAuthLogin(c)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	var response map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Nil(t, response["token"])
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// TestOAuthLoginAutoCreateRollsBackOnSubjectFailure: a failure creating the
+// self prayer_subject must roll back the whole account (no partial create).
+func TestOAuthLoginAutoCreateRollsBackOnSubjectFailure(t *testing.T) {
+	registerMockProvider(t, defaultMockProvider())
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows(externalIdentityColumns()))
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows(userProfileTestColumns()))
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectBegin()
+	mock.ExpectQuery(`INSERT INTO "user_profile"`).WillReturnRows(sqlmock.NewRows([]string{"user_profile_id"}).AddRow(42))
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"prayer_subject_id"}))
+	mock.ExpectQuery(`INSERT INTO "prayer_subject"`).WillReturnError(assert.AnError)
+	mock.ExpectRollback()
+
+	c, w := oauthContext(t, "planningcenter", "/auth/oauth/planningcenter/login", validLoginBody())
+	OAuthLogin(c)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 

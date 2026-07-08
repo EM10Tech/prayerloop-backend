@@ -337,9 +337,15 @@ func createPendingLink(userID int, providerName string, identity *services.Provi
 }
 
 // createOAuthUser auto-creates a prayerloop account for a first-time OAuth
-// login (no email collision) and links the provider identity in the same
-// transaction. A concurrent duplicate (double-tap) is recovered by returning
-// the account the other request created.
+// login (no email collision). The user_profile, self prayer_subject, and
+// provider identity are created in a single transaction so a failure leaves
+// no partial account. A concurrent duplicate (double-tap) is recovered
+// idempotently by returning the account the other request created — note the
+// race usually surfaces on user_profile's UNIQUE(username)/UNIQUE(email)
+// (both requests synthesize the same username from the provider sub), not on
+// UNIQUE(provider, provider_user_id). The welcome email is deliberately sent
+// after commit: an SMTP call must not hold the transaction open, and a failed
+// email must not roll back the account.
 func createOAuthUser(providerName string, identity *services.ProviderIdentity, tokens *services.ProviderTokens) (*models.UserProfile, error) {
 	username, err := synthesizeUsername(providerName, identity.Sub)
 	if err != nil {
@@ -373,7 +379,24 @@ func createOAuthUser(providerName string, identity *services.ProviderIdentity, t
 	var insertedUserID int
 	if _, err := tx.Insert("user_profile").Rows(newUser).Returning("user_profile_id").Executor().ScanVal(&insertedUserID); err != nil {
 		tx.Rollback()
+		if _, isUnique := uniqueViolation(err); isUnique {
+			// Concurrent double-tap: the other request committed first and
+			// owns the synthesized username (and possibly the email). If it
+			// linked this same (provider, sub), return its account. If not
+			// (an unrelated username/email race), fall through to the error —
+			// returning some other user here would be a silent merge.
+			if existing, lookupErr := lookupUserByIdentity(providerName, identity.Sub); lookupErr == nil {
+				return existing, nil
+			}
+		}
 		return nil, fmt.Errorf("failed to insert user_profile: %v", err)
+	}
+
+	txUser := newUser
+	txUser.User_Profile_ID = insertedUserID
+	if _, err := getOrCreateSelfPrayerSubject(tx, txUser); err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("failed to create self prayer_subject: %v", err)
 	}
 
 	newIdentity := buildExternalIdentity(insertedUserID, providerName, identity, tokens)
@@ -399,10 +422,6 @@ func createOAuthUser(providerName string, identity *services.ProviderIdentity, t
 		return nil, fmt.Errorf("failed to load created user %d: %v", insertedUserID, err)
 	}
 
-	// Non-critical follow-ups, matching PublicUserSignup semantics.
-	if _, err := GetOrCreateSelfPrayerSubject(createdUser); err != nil {
-		log.Printf("Failed to create self prayer_subject for user %d: %v", insertedUserID, err)
-	}
 	if createdUser.Email != "" {
 		if emailService := services.GetEmailService(); emailService != nil {
 			if err := emailService.SendWelcomeEmail(createdUser.Email, createdUser.First_Name); err != nil {

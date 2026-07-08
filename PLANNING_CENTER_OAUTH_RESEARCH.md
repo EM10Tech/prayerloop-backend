@@ -2,6 +2,9 @@
 
 > **Status:** Research / planning only — no code changes have been made.
 > **Date:** 2026-06-30
+>
+> ⚠️ **2026-07-07 addendum (§L): Church Center members CANNOT log in via PCO OAuth.** The congregant-login premise behind Scenario 1's reach is invalid — PCO OAuth authenticates Planning Center *users* (admin-granted product access: staff/volunteers) only; Church Center is a separate, passwordless identity system. Verified empirically and against PCO sources. See §L for the finding, evidence, and the revised (data-level) church integration direction.
+> ⚠️ **2026-07-08 addendum (§M): Planning Center deprioritized; Google/Apple are next.** Phase 0 (partial)/Phase 1 shipped (PC login + email-collision interstitial) and stays as-is. The §L.3 org-admin/groups-sync direction is put on hold rather than actively designed further. New work goes into `GoogleProvider`/`AppleProvider` against the same provider-agnostic interface/schema/endpoints already in place. See §M.
 > **Scope:** Add Planning Center Online (PCO) OAuth login + account linking to prayerloop, with Google/Apple social login as a follow-on. Spans three repos: `prayerloop-mobile`, `prayerloop-backend`, `prayerloop-psql`.
 >
 > Confidence tags used throughout: **[OFFICIAL]** = confirmed in PCO/Apple/Expo docs · **[UNVERIFIED]** = could not confirm from official docs, test empirically before relying on it. Claims were produced by a multi-agent research pass and then adversarially verified; verifier corrections are folded in.
@@ -468,9 +471,9 @@ if (response?.type === 'success') {
 
 - **Phase 0 — Schema + backend foundation + refresh-token swap (gates everything).** Migration 026 (`password` nullable + `user_external_identity` + `auth_refresh_token`); `Password *string` + ripple edits (`:301`, `:1211`, `:96-105`, `:197-206`); `authHelpers.go` extractions; `services/crypto.go`; `/auth/refresh` + `/auth/logout` with rotation/reuse-detection; mobile swap of re-login → refresh + `expo-secure-store` + delete `rememberedPassword`. **Delivers a standalone security win (kills plaintext password storage) even before any OAuth ships.**
 - **Phase 1 — Planning Center login (scenarios 1 & 3).** PCO app registration; `services/oauthService.go` (`PlanningCenterProvider`); `OAuthLogin` + auto-create + email-collision interstitial (pending-link); mobile `util/oauth.ts` + "Continue with Planning Center"; `linkedProviders` on user responses. Run the §I.2 empirical tests here.
-- **Phase 2 — Linking / unlinking (scenarios 2 & 4).** `OAuthLink`/`OAuthUnlink`/`ListUserIdentities` + last-auth-method guard + set-password path + provider revoke; mobile `LinkedAccountsCard` + account-deletion integration (add new tables to the manual delete sequence).
-- **Phase 3 — Google + Apple.** Reuse the provider-parameterized endpoints (new provider impls + id_token verification per JWKS). `expo-apple-authentication` (iOS, Guideline 4.8) + `@react-native-google-signin/google-signin`. New env: `GOOGLE_*`, `APPLE_*` (Apple client_secret is a `.p8`-signed JWT).
-- **Future (don't deep-design now):** multi-church (relax `uq_uei_user_provider` to include `organization_id`; authorize-per-org) and pulling PC groups (request `groups` scope; server-to-server sync via the stored refresh token).
+- **Phase 2 — Linking / unlinking (scenarios 2 & 4). [Provider-agnostic — still needed for whichever provider ships first, see §M]** `OAuthLink`/`OAuthUnlink`/`ListUserIdentities` + last-auth-method guard + set-password path + provider revoke; mobile `LinkedAccountsCard` + account-deletion integration (add new tables to the manual delete sequence).
+- **Phase 3 — Google + Apple. [PROMOTED to current priority, 2026-07-08 — see §M]** Reuse the provider-parameterized endpoints (new provider impls + id_token verification per JWKS). `expo-apple-authentication` (iOS, Guideline 4.8) + `@react-native-google-signin/google-signin`. New env: `GOOGLE_*`, `APPLE_*` (Apple client_secret is a `.p8`-signed JWT).
+- **Future (don't deep-design now):** multi-church (relax `uq_uei_user_provider` to include `organization_id`; authorize-per-org) and pulling PC groups (request `groups` scope; server-to-server sync via the stored refresh token). **2026-07-07: groups sync has been promoted from afterthought to the primary church-integration direction — see §L.3.**
 
 ---
 
@@ -491,3 +494,98 @@ if (response?.type === 'success') {
 - **Account-linking security:** nOAuth (`https://www.descope.com/blog/post/noauth`), pre-account-takeover research, handling unverified provider emails
 
 > Generated from a multi-agent research + adversarial-verification pass. Items tagged **[UNVERIFIED]** must be confirmed empirically before implementation.
+
+---
+
+## L. 2026-07-07 addendum — Church Center login limitation & revised church integration
+
+### L.1 The finding
+
+**Church Center members cannot authenticate at PCO's OAuth authorize endpoint.** `api.planningcenteronline.com/oauth/authorize` sends users to the Planning Center login, which only accepts **Planning Center users** — people a church admin has granted product access (staff/volunteers). Church Center accounts are a **separate identity system** (passwordless email/SMS codes on the church's `churchcenter.com` subdomain) that creates a People *profile* but no Planning Center *login*.
+
+**Empirical repro (2026-07-07):** created a Church Center account `zdelcoco+test1@gmail.com` in the em10tech org (signup completed; member portal fully usable). At the OAuth authorize login, both email and phone produce: *"There are no active accounts using the provided email address as their login method. Try another email or phone number. If you need to recover a lost account, contact your church administrators."* Not a propagation delay — the login account genuinely doesn't exist.
+
+**Corroboration:**
+- [planningcenter/developers#1460 "Church Center members SSO"](https://github.com/planningcenter/developers/issues/1460) (April 2026, **open, unanswered**) — identical use case (church app SSO for Church Center members), identical verbatim error.
+- [planningcenter/developers#308](https://github.com/planningcenter/developers/issues/308) (2017) — PCO staff: *"right now it is only admins and volunteers in Services"* can log in; congregant login was "in the works" post login-rebuild but evidently never shipped for OAuth.
+- The [OIDC announcement](https://www.planningcenter.com/changelog/integrations-api/new-openid-connect-for-privacy-conscious-authentication) covers "Planning Center users" — it's the same PC-user OAuth with a privacy-scoped identity claim, not member SSO. **[OFFICIAL]**
+- [PCO login help](https://help.planningcenter.com/en/140717-log-in-to-planning-center.html) frames planningcenter.com logins as admin-provisioned.
+
+**Impact on this doc:** Scenario 1 ("new PC user installs → logs in with PC") works exactly as designed but only reaches the staff/volunteer slice of a congregation, not Church Center-only members. The shipped Phase 0/1 code needs **no changes**; Google/Apple (Phase 3) now carry the general signup-friction story, and PC-specific value shifts to §L.3. Worth nudging PCO on #1460 for a roadmap answer before any larger pivot.
+
+**Local testing note:** to give a test person a PC login, an em10tech admin grants them any minimal app permission in People, which emails an invite to create a password; after acceptance the OAuth flow accepts them.
+
+### L.2 Why data-level integration still works
+
+The wall is login-layer only — **PCO's data layer is unified**. A Church Center signup creates a People profile in the org, and Groups memberships hang off that profile. So an **admin-authorized org connection** can see every congregant and every group roster, even though those members can't authenticate themselves. Identity bridging happens by **email match** instead of SSO.
+
+### L.3 Revised design — "church connection" (groups → prayer circles)
+
+The org-level model, replacing member SSO as the church-facing integration:
+
+1. **Church admin links their PCO org to prayerloop.** Admins always have real PC logins, so the existing OAuth flow works unchanged; add a `groups` (+ likely `people`) scope variant and mark the grant as an org connection rather than a personal login. Encrypted token storage already exists (§D); the **token refresh job (§E.3) is promoted from deferred to prerequisite** — this connection must keep working in the background (access tokens ~2h, refresh ~90d, rotating).
+2. **Admin maps PCO groups → prayer circles.** `GET /groups/v2/groups` with the admin token; map each group to an existing circle or bulk-create. Mapping is opt-in per group — unmapped groups are never synced (privacy posture).
+3. **Membership verification = verified-email match.** For each mapped group, pull memberships and match roster emails against prayerloop accounts with **verified** emails. Two-sided verification: the admin-curated PCO roster vouches for membership; prayerloop verifies email ownership. Matched users are auto-added to the circle.
+4. **Unmatched roster members → church-branded invites** ("Grace Church added you to the Men's Ministry prayer circle"); on signup with that verified email they land in their circles automatically. This is the friction-reduction marketing story recovered: *your church's prayer circles are already waiting for you.*
+5. **Progressive enhancement for PC users:** staff/volunteers who do PC OAuth login can have their own groups pulled with their own token via `GET /groups/v2/groups?filter=my_groups` (works for non-admin PC users — per [planningcenter/developers#1296](https://github.com/planningcenter/developers/issues/1296)) and self-serve join mapped circles.
+
+**Design caveats:**
+- **Household/shared emails** are common in PCO People — an email match can be ambiguous or wrong-person (e.g., spouse matched into the wrong ministry circle). Exact verified-email match only; give circle admins an approval queue for auto-joins (or per-church automatic-vs-approval setting).
+- **Connection fragility:** the org connection rides one admin's PCO account — staff turnover, password reset, or 90 days of disuse kills the refresh token. Needs re-connect UX, connection health monitoring, ideally a second admin connection as backup.
+- **PII/consent:** syncing congregation names/emails under admin authorization — restrict to mapped groups, church-branded invite emails, data-sharing consent in church onboarding.
+- **Ruled out:** building on Church Center's internal app API (undocumented/unofficial; one silent change from breaking a commercial product).
+
+### L.4 Spike before designing further (~30 min, Bruno + em10tech org)
+
+1. Create a test group in em10tech (e.g. "Men's Ministry") with the test1 person as a member.
+2. Auth with an admin **Personal Access Token** via HTTP basic auth (PATs are valid for direct API calls — the earlier misconfiguration was using them as *OAuth* creds).
+3. `GET /groups/v2/groups` → confirm group visibility/permission requirements for the connecting user. **[UNVERIFIED]**
+4. `GET /groups/v2/groups/:id/memberships` → confirm the membership record carries `email_address` directly, or whether emails must be resolved through the People API via the person ID (needs `people` scope). **[UNVERIFIED]**
+5. Check whether PCO **webhooks** cover Groups membership created/destroyed events; otherwise scheduled polling (fine at PCO's ~100 req/20s rate limit — church rosters are small). **[UNVERIFIED]**
+
+If the spike confirms the fields, phasing falls out naturally: org connection + refresh job → group-to-circle mapping + sync + email match → invites for unmatched → webhooks/polling cadence.
+
+---
+
+## M. 2026-07-08 addendum — Planning Center deprioritized; Google/Apple are next
+
+### M.1 The decision
+
+Planning Center login is **no longer top priority**. §L already showed PCO OAuth only reaches the staff/volunteer slice of a congregation (not Church Center members), which was the main reach argument for Scenario 1. The §L.3 "church connection" (org-admin-authorized groups → prayer-circle sync) is a real, still-valid idea, but it's a **larger, separate initiative** (admin dashboard, group-mapping UX, a background token-refresh job, ongoing PCO API maintenance) that doesn't need to gate general auth work. It's parked, not abandoned.
+
+**What ships now instead:** Google and Apple sign-in, which cover the actual near-term goal — broader signup/login coverage for everyone, not just churches on Planning Center.
+
+### M.2 Why this doesn't strand the PCO work already built
+
+The Phase 0/Phase 1 code shipped on this branch (`controllers/oauthController.go`, `services/oauthService.go`, `services/crypto.go`, `models/userIdentity.go`, migration for `user_external_identity`/`oauth_pending_link`) was **already designed provider-first, not PC-first**:
+
+- Routes are `/auth/oauth/:provider/login` and `/auth/oauth/:provider/confirm-link` — never PC-specific paths.
+- `services.OAuthProvider` is an interface (`Name`, `ExchangeCode`, `FetchIdentity`); `PlanningCenterProvider` is just today's only registered implementation. `GetOAuthProvider(slug)` resolves by provider slug already.
+- `user_external_identity.provider` is keyed on `(provider, provider_user_id)` with `CHECK (provider IN ('planning_center','google','apple'))` — Google and Apple rows already fit the schema with no migration.
+- The email-collision pending-link mechanism (`createPendingLink`/`OAuthConfirmLink`), the auto-create-in-a-transaction path (`createOAuthUser`), and the "never trust provider email as an identity key" posture are all provider-agnostic — they apply identically to a Google or Apple `sub`.
+
+**Net effect:** dropping PCO priority does not mean reverting or reworking this code. `PlanningCenterProvider` stays registered and working (harmless, tested, cheap to keep) and Google/Apple are added as new implementations of the same interface — not a new architecture.
+
+### M.3 What is and isn't in scope now
+
+**Deprioritized (not scheduled, not deleted):**
+- §L.3 org-admin/groups-sync church integration and its §L.4 spike.
+- Any further PC-specific mobile UI (a dedicated "Continue with Planning Center" button) beyond what's already backend-tested.
+- Chasing [planningcenter/developers#1460](https://github.com/planningcenter/developers/issues/1460) for a congregant-SSO roadmap answer.
+
+**Still needed regardless of provider (do this next, provider-agnostic infra from §D/§I):**
+- **Server-side refresh tokens** (`auth_refresh_token` table already exists from the delete-account wiring, but `POST /auth/refresh`/`POST /auth/logout` issuance+rotation were never built). This is a **harder blocker for Google/Apple than it was for PC**: the mobile re-login fallback today replays a stored raw password (`util/reLogin.ts`), which doesn't exist for *any* OAuth-only account. Google/Apple can't ship to mobile without this.
+- Linking/unlinking (Scenario 2/4: `OAuthLink`/`OAuthUnlink`/`ListUserIdentities`, last-auth-method guard, set-password path) — still useful so a Google or Apple identity can be linked to/unlinked from an existing account, exactly as designed for PC.
+
+**New work — provider implementations:**
+- `GoogleProvider` (`services/oauthService.go`): closest shape to `PlanningCenterProvider` — authorization-code exchange + a userinfo endpoint (`https://openidconnect.googleapis.com/v1/userinfo` or decode the returned `id_token`). `email_verified` **is** a real, trustworthy claim from Google — unlike PCO, a verified Google email *can* ease account creation, though the interstitial-before-merge rule (§H.2) still applies to linking into a pre-existing account.
+- `AppleProvider`: **shape wrinkle, not a redesign.** Apple has no separate userinfo REST call — identity arrives as a signed `id_token` in the token-exchange response itself. `AppleProvider.FetchIdentity` verifies/decodes that JWT against Apple's JWKS (`https://appleid.apple.com/auth/keys`) locally rather than doing an HTTP GET like PC/Google do. Apple also only returns `email`/`name` on the **first** authorization ever — must be captured and persisted then, or it's gone. Apple's client "secret" is a `.p8`-signed JWT the backend mints per request (`APPLE_TEAM_ID`/`APPLE_KEY_ID`/`APPLE_PRIVATE_KEY`), not a static value like `PC_CLIENT_SECRET`.
+- Mobile: `expo-apple-authentication` (iOS, satisfies Guideline 4.8 per §F.6 — still applies once *any* third-party login is primary-account-eligible) + `@react-native-google-signin/google-signin` (native, per §F.6's rationale over `expo-auth-session`'s Google provider). Both are drop-in against the existing `/auth/oauth/:provider/login` + `/confirm-link` endpoints and `OAuthButtons.tsx` shape from §F.1/F.3 — no new endpoint design needed.
+
+### M.4 Revised phase order
+
+1. Refresh tokens (remaining Phase 0 item) — now a Google/Apple mobile-launch blocker, not just a PC nice-to-have.
+2. `GoogleProvider` + mobile Google button (Guideline-4.8-compliant Apple button ships alongside it, since iOS requires the equivalent-login story the moment any social login is primary).
+3. `AppleProvider` (id_token/JWKS verification path) if not already done in step 2.
+4. Linking/unlinking (Scenario 2/4), now covering all three providers.
+5. §L.3 church-connection idea — revisit only if/when church-specific distribution becomes a priority again.
