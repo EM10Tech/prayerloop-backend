@@ -65,9 +65,15 @@ func main() {
 
 		// user routes
 		auth.GET("/users/me", controllers.GetUserProfile)
+		auth.GET("/users/me/identities", controllers.ListUserIdentities)
+		auth.POST("/users/me/password", controllers.SetPassword)
 		auth.PATCH("/users/:user_profile_id", controllers.UpdateUserProfile)
 		auth.PATCH("/users/:user_profile_id/password", controllers.ChangeUserPassword)
 		auth.DELETE("/users/:user_profile_id/account", controllers.DeleteUserAccount)
+
+		// OAuth account linking/unlinking (scenarios 2 & 4)
+		auth.POST("/auth/oauth/:provider/link", controllers.OAuthLink)
+		auth.DELETE("/auth/oauth/:provider/link", controllers.OAuthUnlink)
 
 		auth.GET("/users/:user_profile_id/groups", controllers.GetUserGroups)
 		auth.PATCH("/users/:user_profile_id/groups/reorder", controllers.ReorderUserGroups)

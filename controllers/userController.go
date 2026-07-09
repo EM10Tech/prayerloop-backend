@@ -1254,6 +1254,52 @@ func ChangeUserPassword(c *gin.Context) {
 	})
 }
 
+// SetPassword handles POST /users/me/password. It sets a first password for
+// an OAuth-only account (Password IS NULL) — the prerequisite for unlinking
+// an account's only provider identity (see OAuthUnlink). There is no old
+// password to verify: the caller's JWT already proves account ownership.
+// Accounts that already have a password must use ChangeUserPassword instead.
+func SetPassword(c *gin.Context) {
+	currentUser := c.MustGet("currentUser").(models.UserProfile)
+
+	if currentUser.Password != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "This account already has a password. Use change password instead."})
+		return
+	}
+
+	var req models.UserProfileSetPassword
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if len(req.Password) < 6 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Password must be at least 6 characters long"})
+		return
+	}
+
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password", "details": err.Error()})
+		return
+	}
+
+	if _, err := initializers.DB.Update("user_profile").
+		Set(goqu.Record{
+			"password":        string(passwordHash),
+			"updated_by":      currentUser.User_Profile_ID,
+			"datetime_update": time.Now(),
+		}).
+		Where(goqu.C("user_profile_id").Eq(currentUser.User_Profile_ID)).
+		Executor().Exec(); err != nil {
+		log.Println("Set password error:", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to set password", "details": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Password set successfully"})
+}
+
 func UpdateUserProfile(c *gin.Context) {
 	currentUser := c.MustGet("currentUser").(models.UserProfile)
 	isAdmin := c.MustGet("admin").(bool)
@@ -1324,12 +1370,13 @@ func UpdateUserProfile(c *gin.Context) {
 			return
 		}
 
-		// Check if email is already in use by another user
-		if email != existingUser.Email {
+		// Check if email is already in use by another user (case-insensitive,
+		// so e.g. "John@x.com" collides with an existing "john@x.com").
+		if !strings.EqualFold(email, existingUser.Email) {
 			emailCount, err := initializers.DB.From("user_profile").
 				Select("email").
 				Where(goqu.And(
-					goqu.C("email").Eq(email),
+					goqu.L("LOWER(email) = LOWER(?)", email),
 					goqu.C("user_profile_id").Neq(userID),
 				)).
 				Count()

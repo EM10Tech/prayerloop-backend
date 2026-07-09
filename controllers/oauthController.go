@@ -287,6 +287,196 @@ func OAuthConfirmLink(c *gin.Context) {
 	respondWithSession(c, user, "Account linked successfully.")
 }
 
+// OAuthLink handles POST /auth/oauth/:provider/link (scenario 2): a
+// logged-in prayerloop user links an additional provider identity to their
+// account. Unlike OAuthLogin there is no auto-create/email-collision
+// branching — the target account is always currentUser.
+func OAuthLink(c *gin.Context) {
+	currentUser := c.MustGet("currentUser").(models.UserProfile)
+
+	provider, ok := services.GetOAuthProvider(c.Param("provider"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Unknown or unconfigured OAuth provider"})
+		return
+	}
+
+	var req models.OAuthCodeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "code, redirect_uri, and code_verifier are required", "details": err.Error()})
+		return
+	}
+
+	tokens, err := provider.ExchangeCode(c.Request.Context(), req.Code, req.RedirectURI, req.CodeVerifier)
+	if err != nil {
+		log.Printf("OAuth %s code exchange failed during link: %v", provider.Name(), err)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Failed to exchange authorization code"})
+		return
+	}
+
+	identity, err := provider.FetchIdentity(c.Request.Context(), tokens)
+	if err != nil {
+		log.Printf("OAuth %s identity fetch failed during link: %v", provider.Name(), err)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to fetch identity from provider"})
+		return
+	}
+
+	var existingIdentity models.UserExternalIdentity
+	found, err := initializers.DB.From("user_external_identity").
+		Select("*").
+		Where(goqu.And(
+			goqu.C("provider").Eq(provider.Name()),
+			goqu.C("provider_user_id").Eq(identity.Sub),
+		)).
+		ScanStruct(&existingIdentity)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to look up identity", "details": err.Error()})
+		return
+	}
+
+	if found {
+		if existingIdentity.User_Profile_ID != currentUser.User_Profile_ID {
+			c.JSON(http.StatusConflict, gin.H{"error": "This provider identity is already linked to another account."})
+			return
+		}
+
+		// Idempotent: already linked to this account. Refresh the stored
+		// tokens/metadata and return success rather than erroring.
+		refreshIdentityRecord(existingIdentity.User_External_Identity_ID, identity, tokens)
+		respondWithLinkedUser(c, http.StatusOK, currentUser, "Account already linked.")
+		return
+	}
+
+	newIdentity := buildExternalIdentity(currentUser.User_Profile_ID, provider.Name(), identity, tokens)
+	if _, err := initializers.DB.Insert("user_external_identity").Rows(newIdentity).Executor().Exec(); err != nil {
+		if constraint, isUnique := uniqueViolation(err); isUnique {
+			if constraint == "uq_uei_user_provider" {
+				c.JSON(http.StatusConflict, gin.H{"error": "This account already has a linked identity for this provider."})
+			} else {
+				c.JSON(http.StatusConflict, gin.H{"error": "This provider identity is already linked to another account."})
+			}
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to link account", "details": err.Error()})
+		return
+	}
+
+	log.Printf("Linked OAuth %s identity %s to user %d", provider.Name(), identity.Sub, currentUser.User_Profile_ID)
+	respondWithLinkedUser(c, http.StatusOK, currentUser, "Account linked successfully.")
+}
+
+// OAuthUnlink handles DELETE /auth/oauth/:provider/link (scenario 4).
+// Unlink always operates on currentUser from CheckAuth — never a
+// client-supplied id — and is blocked when it would remove the account's
+// only authentication method.
+func OAuthUnlink(c *gin.Context) {
+	currentUser := c.MustGet("currentUser").(models.UserProfile)
+
+	provider, ok := services.GetOAuthProvider(c.Param("provider"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Unknown or unconfigured OAuth provider"})
+		return
+	}
+
+	var identity models.UserExternalIdentity
+	found, err := initializers.DB.From("user_external_identity").
+		Select("*").
+		Where(goqu.And(
+			goqu.C("user_profile_id").Eq(currentUser.User_Profile_ID),
+			goqu.C("provider").Eq(provider.Name()),
+		)).
+		ScanStruct(&identity)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to look up identity", "details": err.Error()})
+		return
+	}
+	if !found {
+		c.JSON(http.StatusNotFound, gin.H{"error": "This provider is not linked to your account."})
+		return
+	}
+
+	identityCount, err := initializers.DB.From("user_external_identity").
+		Where(goqu.C("user_profile_id").Eq(currentUser.User_Profile_ID)).
+		Count()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check linked accounts", "details": err.Error()})
+		return
+	}
+
+	if currentUser.Password == nil && identityCount <= 1 {
+		c.JSON(http.StatusConflict, gin.H{"error": "Set a password before unlinking your only sign-in method."})
+		return
+	}
+
+	// Best-effort revoke at the provider before the row (and its tokens) is
+	// deleted. A failed/unavailable revoke must never block the unlink.
+	encrypted := identity.Refresh_Token
+	if encrypted == nil || *encrypted == "" {
+		encrypted = identity.Access_Token
+	}
+	if encrypted != nil && *encrypted != "" {
+		if plaintext, err := services.DecryptToken(*encrypted); err == nil {
+			if err := provider.Revoke(c.Request.Context(), plaintext); err != nil {
+				log.Printf("Best-effort revoke failed for %s identity %d: %v", provider.Name(), identity.User_External_Identity_ID, err)
+			}
+		} else {
+			log.Printf("Failed to decrypt %s token for revocation (identity %d): %v", provider.Name(), identity.User_External_Identity_ID, err)
+		}
+	}
+
+	if _, err := initializers.DB.Delete("user_external_identity").
+		Where(goqu.C("user_external_identity_id").Eq(identity.User_External_Identity_ID)).
+		Executor().Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unlink account", "details": err.Error()})
+		return
+	}
+
+	log.Printf("Unlinked OAuth %s identity from user %d", provider.Name(), currentUser.User_Profile_ID)
+	respondWithLinkedUser(c, http.StatusOK, currentUser, "Account unlinked successfully.")
+}
+
+// ListUserIdentities handles GET /users/me/identities, returning the
+// provider slugs linked to the caller's account.
+func ListUserIdentities(c *gin.Context) {
+	currentUser := c.MustGet("currentUser").(models.UserProfile)
+
+	providers, err := linkedProviders(currentUser.User_Profile_ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load linked identities", "details": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"linkedProviders": providers})
+}
+
+// linkedProviders returns the provider slugs linked to userID, derived from
+// user_external_identity (never a stored boolean — see planning doc §B Q1).
+func linkedProviders(userID int) ([]string, error) {
+	providers := []string{}
+	if err := initializers.DB.From("user_external_identity").
+		Select("provider").
+		Where(goqu.C("user_profile_id").Eq(userID)).
+		Order(goqu.C("provider").Asc()).
+		ScanVals(&providers); err != nil {
+		return nil, err
+	}
+	return providers, nil
+}
+
+// respondWithLinkedUser writes the standard {message, user} response for
+// OAuthLink/OAuthUnlink, with user decorated by its current linkedProviders.
+func respondWithLinkedUser(c *gin.Context, status int, user models.UserProfile, message string) {
+	providers, err := linkedProviders(user.User_Profile_ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load linked identities", "details": err.Error()})
+		return
+	}
+
+	c.JSON(status, gin.H{
+		"message": message,
+		"user":    models.UserWithLinkedProviders{UserProfile: user, LinkedProviders: providers},
+	})
+}
+
 // respondWithSession issues the standard prayerloop JWT + refresh token
 // response shared by all successful auth paths. Refresh-token issuance is
 // best-effort: a failure there must not fail an otherwise-successful login.

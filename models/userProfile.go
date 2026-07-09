@@ -45,3 +45,11 @@ type UserProfileChangePassword struct {
 	Old_Password    string `json:"oldPassword"`
 	New_Password    string `json:"newPassword"`
 }
+
+// UserProfileSetPassword is the body of POST /users/me/password — sets a
+// first password for an OAuth-only account (Password IS NULL). Unlike
+// ChangeUserPassword, there is no old password to verify: the caller's JWT
+// already proves account ownership.
+type UserProfileSetPassword struct {
+	Password string `json:"password" binding:"required"`
+}

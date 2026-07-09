@@ -55,3 +55,12 @@ type OAuthConfirmLinkRequest struct {
 	PendingLinkToken string `json:"pendingLinkToken" binding:"required"`
 	Password         string `json:"password" binding:"required"`
 }
+
+// UserWithLinkedProviders decorates a UserProfile with its derived
+// linkedProviders array (see user_external_identity) for OAuthLink/
+// OAuthUnlink responses. linkedProviders is never a stored column — it's
+// computed per-request from the identity table, the single source of truth.
+type UserWithLinkedProviders struct {
+	UserProfile
+	LinkedProviders []string `json:"linkedProviders"`
+}

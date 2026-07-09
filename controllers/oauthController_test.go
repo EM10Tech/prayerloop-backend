@@ -702,3 +702,264 @@ func TestRevokeRefreshTokenHandlerSuccess(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
+
+// authenticatedOAuthContext builds a context for the link/unlink handlers:
+// currentUser is set (as CheckAuth would) and :provider is bound as a path
+// param. Pass a nil body for DELETE (OAuthUnlink takes none).
+func authenticatedOAuthContext(t *testing.T, user models.UserProfile, method, providerSlug, path string, body interface{}) (*gin.Context, *httptest.ResponseRecorder) {
+	t.Helper()
+	c, w := SetupTestContext()
+	SetAuthenticatedUser(c, user, false)
+
+	var reqBody *bytes.Buffer
+	if body != nil {
+		jsonBody, err := json.Marshal(body)
+		require.NoError(t, err)
+		reqBody = bytes.NewBuffer(jsonBody)
+	} else {
+		reqBody = bytes.NewBuffer(nil)
+	}
+	c.Request = httptest.NewRequest(method, path, reqBody)
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Params = gin.Params{{Key: "provider", Value: providerSlug}}
+	return c, w
+}
+
+func TestOAuthLinkUnknownProvider(t *testing.T) {
+	c, w := authenticatedOAuthContext(t, MockUserWithPassword(), "POST", "nope", "/auth/oauth/nope/link", validLoginBody())
+	OAuthLink(c)
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestOAuthLinkNewIdentity(t *testing.T) {
+	registerMockProvider(t, defaultMockProvider())
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	// No existing identity for (provider, sub) -> insert a fresh link.
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows(externalIdentityColumns()))
+	mock.ExpectExec(`INSERT INTO "user_external_identity"`).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"provider"}).AddRow("planning_center"))
+
+	c, w := authenticatedOAuthContext(t, MockUserWithPassword(), "POST", "planningcenter", "/auth/oauth/planningcenter/link", validLoginBody())
+	OAuthLink(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var response map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Equal(t, "Account linked successfully.", response["message"])
+	userResp, ok := response["user"].(map[string]interface{})
+	require.True(t, ok)
+	assert.Equal(t, []interface{}{"planning_center"}, userResp["linkedProviders"])
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestOAuthLinkIdempotentSameUser(t *testing.T) {
+	registerMockProvider(t, defaultMockProvider())
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	// Identity already bound to currentUser (id 1) -> idempotent success.
+	identityRows := sqlmock.NewRows(externalIdentityColumns()).AddRow(
+		10, 1, "planning_center", "pco_sub_1", nil, nil, nil, nil, nil, nil,
+		time.Now(), time.Now(),
+	)
+	mock.ExpectQuery("SELECT").WillReturnRows(identityRows)
+	mock.ExpectExec(`UPDATE "user_external_identity"`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"provider"}).AddRow("planning_center"))
+
+	c, w := authenticatedOAuthContext(t, MockUserWithPassword(), "POST", "planningcenter", "/auth/oauth/planningcenter/link", validLoginBody())
+	OAuthLink(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var response map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Equal(t, "Account already linked.", response["message"])
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestOAuthLinkConflictDifferentUser(t *testing.T) {
+	registerMockProvider(t, defaultMockProvider())
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	// Identity already bound to a different account (id 99).
+	identityRows := sqlmock.NewRows(externalIdentityColumns()).AddRow(
+		10, 99, "planning_center", "pco_sub_1", nil, nil, nil, nil, nil, nil,
+		time.Now(), time.Now(),
+	)
+	mock.ExpectQuery("SELECT").WillReturnRows(identityRows)
+
+	c, w := authenticatedOAuthContext(t, MockUserWithPassword(), "POST", "planningcenter", "/auth/oauth/planningcenter/link", validLoginBody())
+	OAuthLink(c)
+
+	assert.Equal(t, http.StatusConflict, w.Code)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestOAuthLinkExchangeFailure(t *testing.T) {
+	p := defaultMockProvider()
+	p.exchangeErr = assert.AnError
+	registerMockProvider(t, p)
+
+	c, w := authenticatedOAuthContext(t, MockUserWithPassword(), "POST", "planningcenter", "/auth/oauth/planningcenter/link", validLoginBody())
+	OAuthLink(c)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+func TestOAuthUnlinkUnknownProvider(t *testing.T) {
+	c, w := authenticatedOAuthContext(t, MockUserWithPassword(), "DELETE", "nope", "/auth/oauth/nope/link", nil)
+	OAuthUnlink(c)
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
+func TestOAuthUnlinkNotFound(t *testing.T) {
+	registerMockProvider(t, defaultMockProvider())
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows(externalIdentityColumns()))
+
+	c, w := authenticatedOAuthContext(t, MockUserWithPassword(), "DELETE", "planningcenter", "/auth/oauth/planningcenter/link", nil)
+	OAuthUnlink(c)
+
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestOAuthUnlinkBlockedWithoutPassword(t *testing.T) {
+	registerMockProvider(t, defaultMockProvider())
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	// currentUser has no password and this is their only linked identity.
+	identityRows := sqlmock.NewRows(externalIdentityColumns()).AddRow(
+		10, 1, "planning_center", "pco_sub_1", nil, nil, nil, nil, nil, nil,
+		time.Now(), time.Now(),
+	)
+	mock.ExpectQuery("SELECT").WillReturnRows(identityRows)
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+
+	c, w := authenticatedOAuthContext(t, MockUser(), "DELETE", "planningcenter", "/auth/oauth/planningcenter/link", nil)
+	OAuthUnlink(c)
+
+	assert.Equal(t, http.StatusConflict, w.Code)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestOAuthUnlinkSucceedsWithPassword(t *testing.T) {
+	registerMockProvider(t, defaultMockProvider())
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	identityRows := sqlmock.NewRows(externalIdentityColumns()).AddRow(
+		10, 1, "planning_center", "pco_sub_1", nil, nil, nil, nil, nil, nil,
+		time.Now(), time.Now(),
+	)
+	mock.ExpectQuery("SELECT").WillReturnRows(identityRows)
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectExec(`DELETE FROM "user_external_identity"`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"provider"}))
+
+	c, w := authenticatedOAuthContext(t, MockUserWithPassword(), "DELETE", "planningcenter", "/auth/oauth/planningcenter/link", nil)
+	OAuthUnlink(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var response map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Equal(t, "Account unlinked successfully.", response["message"])
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestOAuthUnlinkSucceedsWithoutPasswordWhenMultipleIdentities(t *testing.T) {
+	registerMockProvider(t, defaultMockProvider())
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	// No password, but a second identity remains after this unlink.
+	identityRows := sqlmock.NewRows(externalIdentityColumns()).AddRow(
+		10, 1, "planning_center", "pco_sub_1", nil, nil, nil, nil, nil, nil,
+		time.Now(), time.Now(),
+	)
+	mock.ExpectQuery("SELECT").WillReturnRows(identityRows)
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(2))
+	mock.ExpectExec(`DELETE FROM "user_external_identity"`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"provider"}).AddRow("google"))
+
+	c, w := authenticatedOAuthContext(t, MockUser(), "DELETE", "planningcenter", "/auth/oauth/planningcenter/link", nil)
+	OAuthUnlink(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestOAuthUnlinkRevokesDecryptedToken(t *testing.T) {
+	setTestTokenCryptoKey(t)
+	registerMockProvider(t, defaultMockProvider())
+	mp, ok := services.GetOAuthProvider("planning_center")
+	require.True(t, ok)
+	mockP := mp.(*mockProvider)
+
+	encRefresh, err := services.EncryptToken("pco-refresh-plaintext")
+	require.NoError(t, err)
+
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	identityRows := sqlmock.NewRows(externalIdentityColumns()).AddRow(
+		10, 1, "planning_center", "pco_sub_1", nil, nil, &encRefresh, nil, nil, nil,
+		time.Now(), time.Now(),
+	)
+	mock.ExpectQuery("SELECT").WillReturnRows(identityRows)
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
+	mock.ExpectExec(`DELETE FROM "user_external_identity"`).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"provider"}))
+
+	c, w := authenticatedOAuthContext(t, MockUserWithPassword(), "DELETE", "planningcenter", "/auth/oauth/planningcenter/link", nil)
+	OAuthUnlink(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	require.Len(t, mockP.revoked, 1)
+	assert.Equal(t, "pco-refresh-plaintext", mockP.revoked[0])
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestListUserIdentities(t *testing.T) {
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	mock.ExpectQuery("SELECT").WillReturnRows(
+		sqlmock.NewRows([]string{"provider"}).AddRow("google").AddRow("planning_center"),
+	)
+
+	c, w := SetupTestContext()
+	SetAuthenticatedUser(c, MockUserWithPassword(), false)
+	c.Request = httptest.NewRequest("GET", "/users/me/identities", nil)
+
+	ListUserIdentities(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var response map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Equal(t, []interface{}{"google", "planning_center"}, response["linkedProviders"])
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestListUserIdentitiesEmpty(t *testing.T) {
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"provider"}))
+
+	c, w := SetupTestContext()
+	SetAuthenticatedUser(c, MockUserWithPassword(), false)
+	c.Request = httptest.NewRequest("GET", "/users/me/identities", nil)
+
+	ListUserIdentities(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var response map[string]interface{}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Equal(t, []interface{}{}, response["linkedProviders"])
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
