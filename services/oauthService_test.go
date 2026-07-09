@@ -159,9 +159,35 @@ func TestVerifyIDTokenSuccess(t *testing.T) {
 		"exp": time.Now().Add(time.Hour).Unix(),
 	})
 
-	claims, err := verifyIDToken(ts.jwks(t), token, []string{"https://issuer.example"}, "client-123")
+	claims, err := verifyIDToken(ts.jwks(t), token, []string{"https://issuer.example"}, []string{"client-123"})
 	require.NoError(t, err)
 	assert.Equal(t, "user-sub", claimString(claims, "sub"))
+}
+
+func TestVerifyIDTokenAcceptsAnyAudienceInAllowedSet(t *testing.T) {
+	ts := newTestJWKSServer(t)
+	token := ts.sign(t, jwt.MapClaims{
+		"iss": "https://issuer.example",
+		"aud": "second-client",
+		"sub": "user-sub",
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+
+	claims, err := verifyIDToken(ts.jwks(t), token, []string{"https://issuer.example"}, []string{"client-123", "second-client"})
+	require.NoError(t, err)
+	assert.Equal(t, "user-sub", claimString(claims, "sub"))
+}
+
+func TestVerifyIDTokenRejectsMissingAudienceClaimEvenWithNoRequiredAudiences(t *testing.T) {
+	ts := newTestJWKSServer(t)
+	token := ts.sign(t, jwt.MapClaims{
+		"iss": "https://issuer.example",
+		"sub": "user-sub",
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+
+	_, err := verifyIDToken(ts.jwks(t), token, []string{"https://issuer.example"}, []string{"client-123"})
+	assert.Error(t, err)
 }
 
 func TestVerifyIDTokenRejectsWrongAudience(t *testing.T) {
@@ -173,7 +199,7 @@ func TestVerifyIDTokenRejectsWrongAudience(t *testing.T) {
 		"exp": time.Now().Add(time.Hour).Unix(),
 	})
 
-	_, err := verifyIDToken(ts.jwks(t), token, []string{"https://issuer.example"}, "client-123")
+	_, err := verifyIDToken(ts.jwks(t), token, []string{"https://issuer.example"}, []string{"client-123"})
 	assert.Error(t, err)
 }
 
@@ -186,7 +212,7 @@ func TestVerifyIDTokenRejectsWrongIssuer(t *testing.T) {
 		"exp": time.Now().Add(time.Hour).Unix(),
 	})
 
-	_, err := verifyIDToken(ts.jwks(t), token, []string{"https://issuer.example"}, "client-123")
+	_, err := verifyIDToken(ts.jwks(t), token, []string{"https://issuer.example"}, []string{"client-123"})
 	assert.Error(t, err)
 }
 
@@ -199,13 +225,13 @@ func TestVerifyIDTokenRejectsExpired(t *testing.T) {
 		"exp": time.Now().Add(-time.Hour).Unix(),
 	})
 
-	_, err := verifyIDToken(ts.jwks(t), token, []string{"https://issuer.example"}, "client-123")
+	_, err := verifyIDToken(ts.jwks(t), token, []string{"https://issuer.example"}, []string{"client-123"})
 	assert.Error(t, err)
 }
 
 func TestVerifyIDTokenRejectsEmpty(t *testing.T) {
 	ts := newTestJWKSServer(t)
-	_, err := verifyIDToken(ts.jwks(t), "", []string{"https://issuer.example"}, "client-123")
+	_, err := verifyIDToken(ts.jwks(t), "", []string{"https://issuer.example"}, []string{"client-123"})
 	assert.Error(t, err)
 }
 
@@ -226,7 +252,7 @@ func TestVerifyIDTokenToleratesClockSkew(t *testing.T) {
 		"exp": time.Now().Add(time.Hour).Unix(),
 	})
 
-	claims, err := verifyIDToken(ts.jwks(t), token, []string{"https://issuer.example"}, "client-123")
+	claims, err := verifyIDToken(ts.jwks(t), token, []string{"https://issuer.example"}, []string{"client-123"})
 	require.NoError(t, err)
 	assert.Equal(t, "user-sub", claimString(claims, "sub"))
 }
@@ -243,7 +269,7 @@ func TestVerifyIDTokenRejectsIssuedFarInTheFuture(t *testing.T) {
 		"exp": time.Now().Add(2 * time.Hour).Unix(),
 	})
 
-	_, err := verifyIDToken(ts.jwks(t), token, []string{"https://issuer.example"}, "client-123")
+	_, err := verifyIDToken(ts.jwks(t), token, []string{"https://issuer.example"}, []string{"client-123"})
 	assert.Error(t, err)
 }
 
@@ -390,15 +416,16 @@ func newTestAppleProvider(t *testing.T, tokenURL, revokeURL string, jwks *keyfun
 	require.NoError(t, err)
 
 	return &AppleProvider{
-		ClientID:   "apple-client-id",
-		TeamID:     "team-id",
-		KeyID:      "key-id",
-		PrivateKey: privateKey,
-		Issuer:     "https://appleid.apple.com",
-		TokenURL:   tokenURL,
-		RevokeURL:  revokeURL,
-		JWKS:       jwks,
-		HTTPClient: &http.Client{Timeout: 5 * time.Second},
+		ClientID:       "apple-client-id",
+		ValidAudiences: []string{"apple-client-id", "com.prayerloop.app"},
+		TeamID:         "team-id",
+		KeyID:          "key-id",
+		PrivateKey:     privateKey,
+		Issuer:         "https://appleid.apple.com",
+		TokenURL:       tokenURL,
+		RevokeURL:      revokeURL,
+		JWKS:           jwks,
+		HTTPClient:     &http.Client{Timeout: 5 * time.Second},
 	}
 }
 
@@ -462,6 +489,42 @@ func TestAppleProviderFetchIdentity(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "apple-sub-123", identity.Sub)
 	assert.Equal(t, "person@example.com", identity.Email)
+}
+
+// TestAppleProviderFetchIdentityAcceptsBundleIDAudience covers the native
+// Sign in with Apple flow (expo-apple-authentication): the id_token it
+// returns is audienced to the app's bundle ID, not the web Services ID
+// (ClientID). ValidAudiences must accept both.
+func TestAppleProviderFetchIdentityAcceptsBundleIDAudience(t *testing.T) {
+	ts := newTestJWKSServer(t)
+	idToken := ts.sign(t, jwt.MapClaims{
+		"iss":   "https://appleid.apple.com",
+		"aud":   "com.prayerloop.app",
+		"sub":   "apple-sub-123",
+		"email": "person@example.com",
+		"exp":   time.Now().Add(time.Hour).Unix(),
+	})
+
+	p := newTestAppleProvider(t, "", "", ts.jwks(t))
+
+	identity, err := p.FetchIdentity(context.Background(), &ProviderTokens{IDToken: idToken})
+	require.NoError(t, err)
+	assert.Equal(t, "apple-sub-123", identity.Sub)
+}
+
+func TestAppleProviderFetchIdentityRejectsAudienceOutsideAllowedSet(t *testing.T) {
+	ts := newTestJWKSServer(t)
+	idToken := ts.sign(t, jwt.MapClaims{
+		"iss": "https://appleid.apple.com",
+		"aud": "com.someone-elses.app",
+		"sub": "apple-sub-123",
+		"exp": time.Now().Add(time.Hour).Unix(),
+	})
+
+	p := newTestAppleProvider(t, "", "", ts.jwks(t))
+
+	_, err := p.FetchIdentity(context.Background(), &ProviderTokens{IDToken: idToken})
+	assert.Error(t, err)
 }
 
 func TestAppleProviderFetchIdentityOmitsEmailOnReturningLogin(t *testing.T) {

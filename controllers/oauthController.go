@@ -48,13 +48,17 @@ func OAuthLogin(c *gin.Context) {
 
 	var req models.OAuthCodeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "code, redirect_uri, and code_verifier are required", "details": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "idToken, or code and redirect_uri, are required", "details": err.Error()})
+		return
+	}
+	if req.IDToken == "" && (req.Code == "" || req.RedirectURI == "") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "idToken, or code and redirect_uri, are required"})
 		return
 	}
 
-	tokens, err := provider.ExchangeCode(c.Request.Context(), req.Code, req.RedirectURI, req.CodeVerifier)
+	tokens, err := resolveProviderTokens(c.Request.Context(), provider, req)
 	if err != nil {
-		log.Printf("OAuth %s code exchange failed: %v", provider.Name(), err)
+		log.Printf("OAuth %s token resolution failed: %v", provider.Name(), err)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Failed to exchange authorization code"})
 		return
 	}
@@ -65,6 +69,7 @@ func OAuthLogin(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to fetch identity from provider"})
 		return
 	}
+	applyForwardedName(identity, req)
 
 	// Branch 1: identity already linked -> returning user.
 	var existingIdentity models.UserExternalIdentity
@@ -302,13 +307,17 @@ func OAuthLink(c *gin.Context) {
 
 	var req models.OAuthCodeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "code, redirect_uri, and code_verifier are required", "details": err.Error()})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "idToken, or code and redirect_uri, are required", "details": err.Error()})
+		return
+	}
+	if req.IDToken == "" && (req.Code == "" || req.RedirectURI == "") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "idToken, or code and redirect_uri, are required"})
 		return
 	}
 
-	tokens, err := provider.ExchangeCode(c.Request.Context(), req.Code, req.RedirectURI, req.CodeVerifier)
+	tokens, err := resolveProviderTokens(c.Request.Context(), provider, req)
 	if err != nil {
-		log.Printf("OAuth %s code exchange failed during link: %v", provider.Name(), err)
+		log.Printf("OAuth %s token resolution failed during link: %v", provider.Name(), err)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Failed to exchange authorization code"})
 		return
 	}
@@ -319,6 +328,7 @@ func OAuthLink(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to fetch identity from provider"})
 		return
 	}
+	applyForwardedName(identity, req)
 
 	var existingIdentity models.UserExternalIdentity
 	found, err := initializers.DB.From("user_external_identity").
@@ -460,6 +470,37 @@ func linkedProviders(userID int) ([]string, error) {
 		return nil, err
 	}
 	return providers, nil
+}
+
+// resolveProviderTokens accepts either shape of models.OAuthCodeRequest: a
+// native SDK identity token (Apple/Google - expo-apple-authentication,
+// @react-native-google-signin/google-signin) or a web/PKCE authorization
+// code (Planning Center). Native tokens skip ExchangeCode entirely -
+// FetchIdentity only ever verifies the ID token locally against the
+// provider's JWKS, so there's no exchange to perform, and a native-issued
+// authorization code couldn't be exchanged server-side anyway: it's scoped
+// to the app's bundle ID, not any client_id/secret this backend holds.
+func resolveProviderTokens(ctx context.Context, provider services.OAuthProvider, req models.OAuthCodeRequest) (*services.ProviderTokens, error) {
+	if req.IDToken != "" {
+		return &services.ProviderTokens{IDToken: req.IDToken}, nil
+	}
+	return provider.ExchangeCode(ctx, req.Code, req.RedirectURI, req.CodeVerifier)
+}
+
+// applyForwardedName overlays a client-forwarded name onto an identity when
+// the provider didn't already supply one. Apple never includes name in the
+// id_token or any endpoint this backend calls - the native SDK hands it to
+// the app directly, and only on the user's first-ever authorization - so
+// this is the only way the backend ever learns it. A no-op for providers
+// (Google, Planning Center) that already populate FirstName/LastName from
+// the verified identity itself.
+func applyForwardedName(identity *services.ProviderIdentity, req models.OAuthCodeRequest) {
+	if identity.FirstName == "" && req.FirstName != "" {
+		identity.FirstName = req.FirstName
+	}
+	if identity.LastName == "" && req.LastName != "" {
+		identity.LastName = req.LastName
+	}
 }
 
 // respondWithLinkedUser writes the standard {message, user} response for

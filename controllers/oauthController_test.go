@@ -136,6 +136,55 @@ func validLoginBody() models.OAuthCodeRequest {
 	}
 }
 
+// nativeLoginBody is the shape a native SDK provider (Apple, Google) sends -
+// an identity token directly, no code/redirect_uri/code_verifier at all.
+func nativeLoginBody() models.OAuthCodeRequest {
+	return models.OAuthCodeRequest{IDToken: "native-id-token"}
+}
+
+// --- resolveProviderTokens / applyForwardedName ----------------------------
+
+func TestResolveProviderTokensPrefersIDTokenOverCode(t *testing.T) {
+	p := defaultMockProvider()
+	p.exchangeErr = assert.AnError // would surface as an error if ExchangeCode were (wrongly) called
+
+	tokens, err := resolveProviderTokens(context.Background(), p, models.OAuthCodeRequest{IDToken: "native-id-token"})
+	require.NoError(t, err)
+	assert.Equal(t, "native-id-token", tokens.IDToken)
+}
+
+func TestResolveProviderTokensFallsBackToExchangeCode(t *testing.T) {
+	p := defaultMockProvider()
+
+	tokens, err := resolveProviderTokens(context.Background(), p, models.OAuthCodeRequest{
+		Code:        "auth-code",
+		RedirectURI: "prayerloop://oauth-callback",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, p.tokens, tokens)
+}
+
+func TestApplyForwardedNameFillsEmptyFields(t *testing.T) {
+	identity := &services.ProviderIdentity{Sub: "apple-sub"}
+	applyForwardedName(identity, models.OAuthCodeRequest{FirstName: "Jane", LastName: "Doe"})
+	assert.Equal(t, "Jane", identity.FirstName)
+	assert.Equal(t, "Doe", identity.LastName)
+}
+
+func TestApplyForwardedNameNeverOverwritesProviderSuppliedName(t *testing.T) {
+	identity := &services.ProviderIdentity{Sub: "google-sub", FirstName: "Existing", LastName: "Name"}
+	applyForwardedName(identity, models.OAuthCodeRequest{FirstName: "Jane", LastName: "Doe"})
+	assert.Equal(t, "Existing", identity.FirstName)
+	assert.Equal(t, "Name", identity.LastName)
+}
+
+func TestApplyForwardedNameNoopWhenNothingForwarded(t *testing.T) {
+	identity := &services.ProviderIdentity{Sub: "apple-sub"}
+	applyForwardedName(identity, models.OAuthCodeRequest{})
+	assert.Equal(t, "", identity.FirstName)
+	assert.Equal(t, "", identity.LastName)
+}
+
 func TestOAuthLoginUnknownProvider(t *testing.T) {
 	c, w := oauthContext(t, "nope", "/auth/oauth/nope/login", validLoginBody())
 	OAuthLogin(c)
@@ -150,6 +199,14 @@ func TestOAuthLoginMissingFields(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
+func TestOAuthLoginRejectsEmptyBody(t *testing.T) {
+	registerMockProvider(t, defaultMockProvider())
+
+	c, w := oauthContext(t, "planningcenter", "/auth/oauth/planningcenter/login", gin.H{})
+	OAuthLogin(c)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
 func TestOAuthLoginExchangeFailure(t *testing.T) {
 	p := defaultMockProvider()
 	p.exchangeErr = assert.AnError
@@ -158,6 +215,33 @@ func TestOAuthLoginExchangeFailure(t *testing.T) {
 	c, w := oauthContext(t, "planningcenter", "/auth/oauth/planningcenter/login", validLoginBody())
 	OAuthLogin(c)
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
+}
+
+// TestOAuthLoginNativeTokenSkipsCodeExchange covers the Apple/Google native
+// SDK flow: the request carries an idToken directly, so ExchangeCode must
+// never be invoked. p.exchangeErr is set to a value that would produce a
+// 401 if ExchangeCode were called - a 200 here proves the native branch
+// (resolveProviderTokens) was taken instead.
+func TestOAuthLoginNativeTokenSkipsCodeExchange(t *testing.T) {
+	p := defaultMockProvider()
+	p.exchangeErr = assert.AnError
+	registerMockProvider(t, p)
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	identityRows := sqlmock.NewRows(externalIdentityColumns()).AddRow(
+		10, 1, "planning_center", "pco_sub_1", nil, nil, nil, nil, nil, nil,
+		time.Now(), time.Now(),
+	)
+	mock.ExpectQuery("SELECT").WillReturnRows(identityRows)
+	mock.ExpectQuery("SELECT").WillReturnRows(userProfileRows(MockUserWithPassword()))
+	mock.ExpectExec("UPDATE").WillReturnResult(sqlmock.NewResult(0, 1))
+
+	c, w := oauthContext(t, "planningcenter", "/auth/oauth/planningcenter/login", nativeLoginBody())
+	OAuthLogin(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
 func TestOAuthLoginExistingIdentity(t *testing.T) {
@@ -751,6 +835,24 @@ func TestOAuthLinkNewIdentity(t *testing.T) {
 	userResp, ok := response["user"].(map[string]interface{})
 	require.True(t, ok)
 	assert.Equal(t, []interface{}{"planning_center"}, userResp["linkedProviders"])
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestOAuthLinkNativeTokenSkipsCodeExchange(t *testing.T) {
+	p := defaultMockProvider()
+	p.exchangeErr = assert.AnError
+	registerMockProvider(t, p)
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows(externalIdentityColumns()))
+	mock.ExpectExec(`INSERT INTO "user_external_identity"`).WillReturnResult(sqlmock.NewResult(1, 1))
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"provider"}).AddRow("planning_center"))
+
+	c, w := authenticatedOAuthContext(t, MockUserWithPassword(), "POST", "planningcenter", "/auth/oauth/planningcenter/link", nativeLoginBody())
+	OAuthLink(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 

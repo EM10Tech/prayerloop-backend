@@ -149,16 +149,30 @@ func initAppleProvider() {
 		return
 	}
 
+	// Native Sign in with Apple (expo-apple-authentication) issues an
+	// id_token audienced to the app's bundle ID, not the Services ID above -
+	// both must validate. APPLE_BUNDLE_IDS is optional so a deployment that
+	// only ever does the web/PKCE flow is unaffected.
+	validAudiences := []string{clientID}
+	if bundleIDs := os.Getenv("APPLE_BUNDLE_IDS"); bundleIDs != "" {
+		for _, id := range strings.Split(bundleIDs, ",") {
+			if id = strings.TrimSpace(id); id != "" {
+				validAudiences = append(validAudiences, id)
+			}
+		}
+	}
+
 	RegisterOAuthProvider(&AppleProvider{
-		ClientID:   clientID,
-		TeamID:     teamID,
-		KeyID:      keyID,
-		PrivateKey: privateKey,
-		Issuer:     "https://appleid.apple.com",
-		TokenURL:   "https://appleid.apple.com/auth/token",
-		RevokeURL:  "https://appleid.apple.com/auth/revoke",
-		JWKS:       jwks,
-		HTTPClient: httpClient,
+		ClientID:       clientID,
+		ValidAudiences: validAudiences,
+		TeamID:         teamID,
+		KeyID:          keyID,
+		PrivateKey:     privateKey,
+		Issuer:         "https://appleid.apple.com",
+		TokenURL:       "https://appleid.apple.com/auth/token",
+		RevokeURL:      "https://appleid.apple.com/auth/revoke",
+		JWKS:           jwks,
+		HTTPClient:     httpClient,
 	})
 	log.Println("Apple OAuth provider initialized")
 }
@@ -372,7 +386,7 @@ func (p *PlanningCenterProvider) Revoke(ctx context.Context, token string) error
 // whenever NTP drift exists on either side.
 const clockSkewLeeway = 2 * time.Minute
 
-func verifyIDToken(jwks *keyfunc.JWKS, idToken string, validIssuers []string, audience string) (jwt.MapClaims, error) {
+func verifyIDToken(jwks *keyfunc.JWKS, idToken string, validIssuers []string, validAudiences []string) (jwt.MapClaims, error) {
 	if idToken == "" {
 		return nil, fmt.Errorf("no id_token present in token response")
 	}
@@ -402,7 +416,7 @@ func verifyIDToken(jwks *keyfunc.JWKS, idToken string, validIssuers []string, au
 		return nil, fmt.Errorf("token not valid yet")
 	}
 
-	if !claims.VerifyAudience(audience, true) {
+	if !audienceAllowed(claims, validAudiences) {
 		return nil, fmt.Errorf("audience mismatch")
 	}
 
@@ -413,6 +427,44 @@ func verifyIDToken(jwks *keyfunc.JWKS, idToken string, validIssuers []string, au
 		}
 	}
 	return nil, fmt.Errorf("issuer %q not in allowed set", iss)
+}
+
+// audienceAllowed reports whether the token's aud claim (a single string or
+// an array, per the JWT spec) contains any of the allowed values. Fails
+// closed: a missing/malformed aud claim, or an empty allowed set, is never
+// treated as a match.
+//
+// A custom check (rather than jwt.MapClaims.VerifyAudience in a loop) is
+// necessary because VerifyAudience's "required" flag treats a missing aud
+// claim as valid when false - looping over allowed values with req=false
+// would let a token with no aud claim at all pass as soon as any candidate
+// is tried, which is the opposite of what an allow-list should do.
+func audienceAllowed(claims jwt.MapClaims, allowed []string) bool {
+	raw, ok := claims["aud"]
+	if !ok {
+		return false
+	}
+
+	var actual []string
+	switch v := raw.(type) {
+	case string:
+		actual = []string{v}
+	case []interface{}:
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				actual = append(actual, s)
+			}
+		}
+	}
+
+	for _, a := range actual {
+		for _, want := range allowed {
+			if a == want {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // claimString safely extracts a string claim, returning "" if absent or of
@@ -521,7 +573,7 @@ func (p *GoogleProvider) ExchangeCode(ctx context.Context, code, redirectURI, co
 }
 
 func (p *GoogleProvider) FetchIdentity(ctx context.Context, tokens *ProviderTokens) (*ProviderIdentity, error) {
-	claims, err := verifyIDToken(p.JWKS, tokens.IDToken, p.Issuers, p.ClientID)
+	claims, err := verifyIDToken(p.JWKS, tokens.IDToken, p.Issuers, []string{p.ClientID})
 	if err != nil {
 		return nil, fmt.Errorf("google id_token verification failed: %w", err)
 	}
@@ -587,7 +639,7 @@ func (p *GoogleProvider) Revoke(ctx context.Context, token string) error {
 //     to forward it explicitly — not yet wired into OAuthCodeRequest
 //     (tracked as mobile-side follow-up work, not a backend gap).
 type AppleProvider struct {
-	ClientID   string // Apple "Services ID" identifier
+	ClientID   string // Apple "Services ID" identifier - used for client_secret minting/ExchangeCode
 	TeamID     string
 	KeyID      string
 	PrivateKey *ecdsa.PrivateKey
@@ -596,6 +648,12 @@ type AppleProvider struct {
 	RevokeURL  string
 	JWKS       *keyfunc.JWKS
 	HTTPClient *http.Client
+	// ValidAudiences is every client identifier this backend accepts as an
+	// id_token's aud claim: ClientID (the Services ID, for a future web
+	// flow) plus the app's bundle ID(s). A native Sign in with Apple flow
+	// (expo-apple-authentication) issues an id_token audienced to the
+	// app's bundle ID, not the Services ID - both must validate.
+	ValidAudiences []string
 }
 
 func (p *AppleProvider) Name() string {
@@ -692,7 +750,7 @@ func (p *AppleProvider) ExchangeCode(ctx context.Context, code, redirectURI, cod
 }
 
 func (p *AppleProvider) FetchIdentity(ctx context.Context, tokens *ProviderTokens) (*ProviderIdentity, error) {
-	claims, err := verifyIDToken(p.JWKS, tokens.IDToken, []string{p.Issuer}, p.ClientID)
+	claims, err := verifyIDToken(p.JWKS, tokens.IDToken, []string{p.Issuer}, p.ValidAudiences)
 	if err != nil {
 		return nil, fmt.Errorf("apple id_token verification failed: %w", err)
 	}

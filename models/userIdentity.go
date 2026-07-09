@@ -42,12 +42,31 @@ type OAuthPendingLink struct {
 	Created_At            time.Time  `json:"-" db:"created_at" goqu:"skipinsert"`
 }
 
-// OAuthCodeRequest is the body of POST /auth/oauth/:provider/login.
-// Field names match what expo-auth-session hands the mobile app.
+// OAuthCodeRequest is the body of POST /auth/oauth/:provider/login and
+// .../link. Exactly one of two shapes is expected, validated in the handler
+// (not via binding tags, since only one shape's fields are required per
+// request):
+//   - Web/PKCE code-exchange flow (Planning Center): Code + RedirectURI,
+//     with CodeVerifier passed through as-is. The backend exchanges the
+//     code server-side (confidential client, holds the provider secret).
+//   - Native SDK flow (Apple/Google - expo-apple-authentication,
+//     @react-native-google-signin/google-signin): IDToken directly. The
+//     native SDK already returns a signed identity token; no code exchange
+//     is needed or even possible - a native-issued authorization code is
+//     scoped to the app's bundle ID, not any client_id/secret this backend
+//     holds.
 type OAuthCodeRequest struct {
-	Code         string `json:"code" binding:"required"`
-	RedirectURI  string `json:"redirect_uri" binding:"required"`
-	CodeVerifier string `json:"code_verifier" binding:"required"`
+	Code         string `json:"code"`
+	RedirectURI  string `json:"redirect_uri"`
+	CodeVerifier string `json:"code_verifier"`
+	IDToken      string `json:"idToken"`
+
+	// FirstName/LastName: Apple only. expo-apple-authentication returns the
+	// user's name out-of-band from the id_token, and only on the user's
+	// very first authorization ever - the mobile app must forward it
+	// explicitly since the backend has no other way to learn it.
+	FirstName string `json:"firstName"`
+	LastName  string `json:"lastName"`
 }
 
 // OAuthConfirmLinkRequest is the body of POST /auth/oauth/:provider/confirm-link.
