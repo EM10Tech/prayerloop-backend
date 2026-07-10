@@ -7,11 +7,9 @@ import (
 	"strconv"
 	"strings"
 
-	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v4"
 
 	"github.com/PrayerLoop/initializers"
 	"github.com/PrayerLoop/models"
@@ -93,9 +91,11 @@ func PublicUserSignup(c *gin.Context) {
 		phoneNumber = &user.Phone_Number
 	}
 
+	passwordHashStr := string(passwordHash)
+
 	newUser := models.UserProfile{
 		Username:     user.Username,
-		Password:     string(passwordHash),
+		Password:     &passwordHashStr,
 		Email:        user.Email,
 		First_Name:   user.First_Name,
 		Last_Name:    user.Last_Name,
@@ -194,9 +194,11 @@ func UserSignup(c *gin.Context) {
 		phoneNumber = &user.Phone_Number
 	}
 
+	passwordHashStr := string(passwordHash)
+
 	newUser := models.UserProfile{
 		Username:     user.Username,
-		Password:     string(passwordHash),
+		Password:     &passwordHashStr,
 		Email:        user.Email,
 		First_Name:   user.First_Name,
 		Last_Name:    user.Last_Name,
@@ -298,35 +300,34 @@ func UserLogin(c *gin.Context) {
 		return
 	}
 
-	err = bcrypt.CompareHashAndPassword([]byte(dbUser.Password), []byte(user.Password))
+	// OAuth-only accounts have a NULL password: password login is unavailable,
+	// and a NULL hash must never authenticate.
+	if dbUser.Password == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "This account uses social login. Sign in with your provider or set a password via 'Forgot Password'."})
+		return
+	}
+
+	err = bcrypt.CompareHashAndPassword([]byte(*dbUser.Password), []byte(user.Password))
 	if err != nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
 	}
 
-	role := ""
-	if dbUser.Admin {
-		role = "admin"
-	} else {
-		role = "user"
-	}
-
-	generateToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"id":   dbUser.User_Profile_ID,
-		"exp":  time.Now().Add(time.Hour * 24).Unix(),
-		"role": role,
-	})
-
-	token, err := generateToken.SignedString([]byte(os.Getenv("SECRET")))
-
+	token, err := generateAccessToken(dbUser)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to generate token", "details": err.Error()})
 	}
 
+	refreshToken, err := issueRefreshToken(dbUser.User_Profile_ID, "")
+	if err != nil {
+		log.Printf("Failed to issue refresh token for user %d: %v", dbUser.User_Profile_ID, err)
+	}
+
 	c.JSON(200, gin.H{
-		"message": "User logged in successfully.",
-		"token":   token,
-		"user":    dbUser,
+		"message":      "User logged in successfully.",
+		"token":        token,
+		"refreshToken": refreshToken,
+		"user":         dbUser,
 	})
 }
 
@@ -1206,9 +1207,11 @@ func ChangeUserPassword(c *gin.Context) {
 		return
 	}
 
-	// Verify old password (unless admin is changing another user's password)
-	if userID == currentUser.User_Profile_ID {
-		err = bcrypt.CompareHashAndPassword([]byte(existingUser.Password), []byte(passwordChange.Old_Password))
+	// Verify old password (unless admin is changing another user's password).
+	// OAuth-only accounts (NULL password) skip the check so they can set a
+	// first password — the JWT already proves account ownership.
+	if userID == currentUser.User_Profile_ID && existingUser.Password != nil {
+		err = bcrypt.CompareHashAndPassword([]byte(*existingUser.Password), []byte(passwordChange.Old_Password))
 		if err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Current password is incorrect"})
 			return
@@ -1249,6 +1252,52 @@ func ChangeUserPassword(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Password changed successfully",
 	})
+}
+
+// SetPassword handles POST /users/me/password. It sets a first password for
+// an OAuth-only account (Password IS NULL) — the prerequisite for unlinking
+// an account's only provider identity (see OAuthUnlink). There is no old
+// password to verify: the caller's JWT already proves account ownership.
+// Accounts that already have a password must use ChangeUserPassword instead.
+func SetPassword(c *gin.Context) {
+	currentUser := c.MustGet("currentUser").(models.UserProfile)
+
+	if currentUser.Password != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": "This account already has a password. Use change password instead."})
+		return
+	}
+
+	var req models.UserProfileSetPassword
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if len(req.Password) < 6 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Password must be at least 6 characters long"})
+		return
+	}
+
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password", "details": err.Error()})
+		return
+	}
+
+	if _, err := initializers.DB.Update("user_profile").
+		Set(goqu.Record{
+			"password":        string(passwordHash),
+			"updated_by":      currentUser.User_Profile_ID,
+			"datetime_update": time.Now(),
+		}).
+		Where(goqu.C("user_profile_id").Eq(currentUser.User_Profile_ID)).
+		Executor().Exec(); err != nil {
+		log.Println("Set password error:", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to set password", "details": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Password set successfully"})
 }
 
 func UpdateUserProfile(c *gin.Context) {
@@ -1321,12 +1370,13 @@ func UpdateUserProfile(c *gin.Context) {
 			return
 		}
 
-		// Check if email is already in use by another user
-		if email != existingUser.Email {
+		// Check if email is already in use by another user (case-insensitive,
+		// so e.g. "John@x.com" collides with an existing "john@x.com").
+		if !strings.EqualFold(email, existingUser.Email) {
 			emailCount, err := initializers.DB.From("user_profile").
 				Select("email").
 				Where(goqu.And(
-					goqu.C("email").Eq(email),
+					goqu.L("LOWER(email) = LOWER(?)", email),
 					goqu.C("user_profile_id").Neq(userID),
 				)).
 				Count()
@@ -1509,6 +1559,22 @@ func DeleteUserAccount(c *gin.Context) {
 		return
 	}
 
+	// 2b. Revoke any linked OAuth provider tokens before the identity rows
+	// below are deleted (Apple mandates revoke-on-account-delete). This is
+	// best-effort by design — a failed revoke must never block deletion.
+	revokeIdentityTokens(c.Request.Context(), userID)
+
+	// 2c. Delete OAuth identity links, pending links, and refresh tokens
+	// (optional tables — added by migrations 026/027)
+	for _, table := range []string{"user_external_identity", "oauth_pending_link", "auth_refresh_token"} {
+		err = safeDeleteOptional(table, goqu.C("user_profile_id").Eq(userID))
+		if err != nil {
+			log.Printf("Failed to delete %s: %v", table, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete OAuth account data", "details": err.Error()})
+			return
+		}
+	}
+
 	// 3. Delete prayer session details (must delete BEFORE prayer_session due to FK)
 	// prayer_session_detail links to prayer_session, not directly to user
 	_, err = initializers.DB.Delete("prayer_session_detail").
@@ -1632,13 +1698,25 @@ func DeleteUserAccount(c *gin.Context) {
 	})
 }
 
+// selfSubjectDB is the subset of goqu operations getOrCreateSelfPrayerSubject
+// needs; both *goqu.Database and *goqu.TxDatabase satisfy it, so the subject
+// can be created inside a caller's transaction.
+type selfSubjectDB interface {
+	From(from ...interface{}) *goqu.SelectDataset
+	Insert(table interface{}) *goqu.InsertDataset
+}
+
 // GetOrCreateSelfPrayerSubject finds or creates a "self" prayer_subject for a user.
 // A "self" prayer_subject is one where the user is praying for themselves.
 // This is identified by: created_by = user_profile_id AND user_profile_id = user_profile_id (linked to self)
 func GetOrCreateSelfPrayerSubject(user models.UserProfile) (int, error) {
+	return getOrCreateSelfPrayerSubject(initializers.DB, user)
+}
+
+func getOrCreateSelfPrayerSubject(db selfSubjectDB, user models.UserProfile) (int, error) {
 	// First, try to find an existing "self" prayer_subject
 	var existingSubjectID int
-	found, err := initializers.DB.From("prayer_subject").
+	found, err := db.From("prayer_subject").
 		Select("prayer_subject_id").
 		Where(
 			goqu.And(
@@ -1676,7 +1754,7 @@ func GetOrCreateSelfPrayerSubject(user models.UserProfile) (int, error) {
 		Updated_By:                  user.User_Profile_ID,
 	}
 
-	insert := initializers.DB.Insert("prayer_subject").Rows(newSubject).Returning("prayer_subject_id")
+	insert := db.Insert("prayer_subject").Rows(newSubject).Returning("prayer_subject_id")
 
 	var insertedID int
 	_, err = insert.Executor().ScanVal(&insertedID)

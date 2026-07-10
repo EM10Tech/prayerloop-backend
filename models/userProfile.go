@@ -5,7 +5,7 @@ import "time"
 type UserProfile struct {
 	User_Profile_ID    int       `json:"userProfileId" goqu:"skipinsert"`
 	Username           string    `json:"username"`
-	Password           string    `json:"-"`
+	Password           *string   `json:"-"` // NULL for OAuth-only accounts; treat nil as "password login unavailable"
 	Email              string    `json:"email"`
 	First_Name         string    `json:"firstName"`
 	Last_Name          string    `json:"lastName"`
@@ -44,4 +44,12 @@ type UserProfileChangePassword struct {
 	User_Profile_ID int    `json:"userProfileId" goqu:"skipinsert"`
 	Old_Password    string `json:"oldPassword"`
 	New_Password    string `json:"newPassword"`
+}
+
+// UserProfileSetPassword is the body of POST /users/me/password — sets a
+// first password for an OAuth-only account (Password IS NULL). Unlike
+// ChangeUserPassword, there is no old password to verify: the caller's JWT
+// already proves account ownership.
+type UserProfileSetPassword struct {
+	Password string `json:"password" binding:"required"`
 }
