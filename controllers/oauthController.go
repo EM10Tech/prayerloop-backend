@@ -240,12 +240,16 @@ func OAuthConfirmLink(c *gin.Context) {
 		Where(goqu.C("oauth_pending_link_id").Eq(pending.OAuth_Pending_Link_ID)).
 		Executor().Exec()
 	if err != nil {
-		tx.Rollback()
+		if rbErr := tx.Rollback(); rbErr != nil {
+			log.Printf("Failed to rollback transaction: %v", rbErr)
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete link", "details": err.Error()})
 		return
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
-		tx.Rollback()
+		if rbErr := tx.Rollback(); rbErr != nil {
+			log.Printf("Failed to rollback transaction: %v", rbErr)
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired link token"})
 		return
 	}
@@ -262,7 +266,9 @@ func OAuthConfirmLink(c *gin.Context) {
 		Organization_ID:  pending.Organization_ID,
 	}
 	if _, err := tx.Insert("user_external_identity").Rows(newIdentity).Executor().Exec(); err != nil {
-		tx.Rollback()
+		if rbErr := tx.Rollback(); rbErr != nil {
+			log.Printf("Failed to rollback transaction: %v", rbErr)
+		}
 
 		if constraint, isUnique := uniqueViolation(err); isUnique {
 			// Raced against another link of the same provider identity or a
@@ -617,7 +623,9 @@ func createOAuthUser(providerName string, identity *services.ProviderIdentity, t
 
 	var insertedUserID int
 	if _, err := tx.Insert("user_profile").Rows(newUser).Returning("user_profile_id").Executor().ScanVal(&insertedUserID); err != nil {
-		tx.Rollback()
+		if rbErr := tx.Rollback(); rbErr != nil {
+			log.Printf("Failed to rollback transaction: %v", rbErr)
+		}
 		if _, isUnique := uniqueViolation(err); isUnique {
 			// Concurrent double-tap: the other request committed first and
 			// owns the synthesized username (and possibly the email). If it
@@ -634,13 +642,17 @@ func createOAuthUser(providerName string, identity *services.ProviderIdentity, t
 	txUser := newUser
 	txUser.User_Profile_ID = insertedUserID
 	if _, err := getOrCreateSelfPrayerSubject(tx, txUser); err != nil {
-		tx.Rollback()
+		if rbErr := tx.Rollback(); rbErr != nil {
+			log.Printf("Failed to rollback transaction: %v", rbErr)
+		}
 		return nil, fmt.Errorf("failed to create self prayer_subject: %v", err)
 	}
 
 	newIdentity := buildExternalIdentity(insertedUserID, providerName, identity, tokens)
 	if _, err := tx.Insert("user_external_identity").Rows(newIdentity).Executor().Exec(); err != nil {
-		tx.Rollback()
+		if rbErr := tx.Rollback(); rbErr != nil {
+			log.Printf("Failed to rollback transaction: %v", rbErr)
+		}
 		if _, isUnique := uniqueViolation(err); isUnique {
 			// Concurrent request already created and linked this identity.
 			return lookupUserByIdentity(providerName, identity.Sub)
