@@ -439,6 +439,34 @@ func TestUpdateUserProfile(t *testing.T) {
 			expectError:     true,
 		},
 		{
+			name:        "email already in use - differs only by case",
+			userID:      "1",
+			currentUser: MockUser(),
+			isAdmin:     false,
+			requestBody: models.UserProfileUpdate{
+				Email: ptrString("TAKEN@EXAMPLE.COM"),
+			},
+			mockUser:       ptrUserProfile(MockUser()),
+			mockEmailCount: 1,
+			expectedStatus: http.StatusBadRequest,
+			expectError:    true,
+		},
+		{
+			// Same email as the account already has, differing only by case:
+			// treated as unchanged (no spurious "already in use" against self),
+			// same as submitting the exact-current-case email would be.
+			name:        "email unchanged aside from case - no spurious collision",
+			userID:      "1",
+			currentUser: MockUser(),
+			isAdmin:     false,
+			requestBody: models.UserProfileUpdate{
+				Email: ptrString("TEST@EXAMPLE.COM"), // MockUser().Email is "test@example.com"
+			},
+			mockUser:       ptrUserProfile(MockUser()),
+			expectedStatus: http.StatusBadRequest,
+			expectError:    true,
+		},
+		{
 			name:        "username already taken",
 			userID:      "1",
 			currentUser: MockUser(),
@@ -771,6 +799,65 @@ func TestChangeUserPassword(t *testing.T) {
 	}
 }
 
+// TestSetPassword tests the SetPassword endpoint (POST /users/me/password)
+func TestSetPassword(t *testing.T) {
+	t.Run("sets a first password for an OAuth-only account", func(t *testing.T) {
+		_, mock, cleanup := SetupTestDB(t)
+		defer cleanup()
+
+		mock.ExpectExec("UPDATE").WillReturnResult(sqlmock.NewResult(0, 1))
+
+		c, w := SetupTestContext()
+		SetAuthenticatedUser(c, MockUser(), false) // MockUser has Password == nil
+		body, _ := json.Marshal(models.UserProfileSetPassword{Password: "newpassword123"})
+		c.Request = httptest.NewRequest("POST", "/users/me/password", bytes.NewBuffer(body))
+		c.Request.Header.Set("Content-Type", "application/json")
+
+		SetPassword(c)
+
+		assert.Equal(t, http.StatusOK, w.Code)
+		var response map[string]interface{}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+		assert.Equal(t, "Password set successfully", response["message"])
+		assert.NoError(t, mock.ExpectationsWereMet())
+	})
+
+	t.Run("rejects when account already has a password", func(t *testing.T) {
+		c, w := SetupTestContext()
+		SetAuthenticatedUser(c, MockUserWithPassword(), false)
+		body, _ := json.Marshal(models.UserProfileSetPassword{Password: "newpassword123"})
+		c.Request = httptest.NewRequest("POST", "/users/me/password", bytes.NewBuffer(body))
+		c.Request.Header.Set("Content-Type", "application/json")
+
+		SetPassword(c)
+
+		assert.Equal(t, http.StatusConflict, w.Code)
+	})
+
+	t.Run("rejects a too-short password", func(t *testing.T) {
+		c, w := SetupTestContext()
+		SetAuthenticatedUser(c, MockUser(), false)
+		body, _ := json.Marshal(models.UserProfileSetPassword{Password: "short"})
+		c.Request = httptest.NewRequest("POST", "/users/me/password", bytes.NewBuffer(body))
+		c.Request.Header.Set("Content-Type", "application/json")
+
+		SetPassword(c)
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+	})
+
+	t.Run("rejects a missing password field", func(t *testing.T) {
+		c, w := SetupTestContext()
+		SetAuthenticatedUser(c, MockUser(), false)
+		c.Request = httptest.NewRequest("POST", "/users/me/password", bytes.NewBuffer([]byte(`{}`)))
+		c.Request.Header.Set("Content-Type", "application/json")
+
+		SetPassword(c)
+
+		assert.Equal(t, http.StatusBadRequest, w.Code)
+	})
+}
+
 // TestDeleteUserAccount tests the DeleteUserAccount endpoint
 func TestDeleteUserAccount(t *testing.T) {
 	tests := []struct {
@@ -868,6 +955,17 @@ func TestDeleteUserAccount(t *testing.T) {
 					mock.ExpectExec("DELETE").WillReturnResult(sqlmock.NewResult(0, 0))
 
 					// 2. password_reset_tokens (optional)
+					mock.ExpectExec("DELETE").WillReturnResult(sqlmock.NewResult(0, 0))
+
+					// 2b. best-effort provider-token revocation looks up any
+					// linked identities before they're deleted below (none
+					// for this fixture user).
+					mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows(externalIdentityColumns()))
+
+					// 2c. user_external_identity, oauth_pending_link,
+					// auth_refresh_token (optional)
+					mock.ExpectExec("DELETE").WillReturnResult(sqlmock.NewResult(0, 0))
+					mock.ExpectExec("DELETE").WillReturnResult(sqlmock.NewResult(0, 0))
 					mock.ExpectExec("DELETE").WillReturnResult(sqlmock.NewResult(0, 0))
 
 					// 3. prayer_session_detail (via subquery)

@@ -16,6 +16,7 @@ func init() {
 	initializers.ConnectDB()
 	services.InitPushNotificationService()
 	services.InitEmailService()
+	services.InitOAuthService()
 }
 
 func main() {
@@ -46,6 +47,14 @@ func main() {
 	router.POST("/auth/verify-reset-code", middlewares.RateLimitMiddleware(5, 5, getKey), controllers.VerifyResetCode)
 	router.POST("/auth/reset-password", middlewares.RateLimitMiddleware(2, 2, getKey), controllers.ResetPassword)
 
+	// OAuth endpoints (provider-parameterized: planning_center now, google/apple later)
+	router.POST("/auth/oauth/:provider/login", middlewares.RateLimitMiddleware(2, 2, getKey), controllers.OAuthLogin)
+	router.POST("/auth/oauth/:provider/confirm-link", middlewares.RateLimitMiddleware(2, 2, getKey), controllers.OAuthConfirmLink)
+
+	// Server-side refresh tokens (shared by password and OAuth logins)
+	router.POST("/auth/refresh", middlewares.RateLimitMiddleware(5, 5, getKey), controllers.RefreshAccessToken)
+	router.POST("/auth/logout", middlewares.RateLimitMiddleware(5, 5, getKey), controllers.RevokeRefreshToken)
+
 	// Test endpoint for email service (remove in production)
 	router.POST("/test/email", middlewares.RateLimitMiddleware(2, 2, getKey), controllers.TestEmailService)
 
@@ -56,9 +65,15 @@ func main() {
 
 		// user routes
 		auth.GET("/users/me", controllers.GetUserProfile)
+		auth.GET("/users/me/identities", controllers.ListUserIdentities)
+		auth.POST("/users/me/password", controllers.SetPassword)
 		auth.PATCH("/users/:user_profile_id", controllers.UpdateUserProfile)
 		auth.PATCH("/users/:user_profile_id/password", controllers.ChangeUserPassword)
 		auth.DELETE("/users/:user_profile_id/account", controllers.DeleteUserAccount)
+
+		// OAuth account linking/unlinking (scenarios 2 & 4)
+		auth.POST("/auth/oauth/:provider/link", controllers.OAuthLink)
+		auth.DELETE("/auth/oauth/:provider/link", controllers.OAuthUnlink)
 
 		auth.GET("/users/:user_profile_id/groups", controllers.GetUserGroups)
 		auth.PATCH("/users/:user_profile_id/groups/reorder", controllers.ReorderUserGroups)

@@ -1,0 +1,946 @@
+package controllers
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/PrayerLoop/initializers"
+	"github.com/PrayerLoop/models"
+	"github.com/PrayerLoop/services"
+	"github.com/doug-martin/goqu/v9"
+	"github.com/gin-gonic/gin"
+	"github.com/lib/pq"
+	"golang.org/x/crypto/bcrypt"
+)
+
+const (
+	pendingLinkTTL         = 10 * time.Minute
+	maxPendingLinkAttempts = 3
+
+	// errCodeEmailCollision is the structured error code the mobile app keys
+	// on to show the "sign in to link" interstitial.
+	errCodeEmailCollision = "OAUTH_EMAIL_COLLISION"
+)
+
+// OAuthLogin handles POST /auth/oauth/:provider/login (scenarios 1 & 3).
+// The app sends the authorization code + PKCE verifier; the backend exchanges
+// them (confidential client), fetches the verified identity, and then:
+//   - identity already linked           -> log the user in
+//   - email matches an existing account -> 409 + pending-link token (NEVER a
+//     silent merge: Planning Center has no email_verified claim, so a PC email
+//     can never be trusted as an identity key)
+//   - otherwise                         -> auto-create a new account + link
+func OAuthLogin(c *gin.Context) {
+	provider, ok := services.GetOAuthProvider(c.Param("provider"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Unknown or unconfigured OAuth provider"})
+		return
+	}
+
+	var req models.OAuthCodeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "idToken, or code and redirect_uri, are required", "details": err.Error()})
+		return
+	}
+	if req.IDToken == "" && (req.Code == "" || req.RedirectURI == "") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "idToken, or code and redirect_uri, are required"})
+		return
+	}
+
+	tokens, err := resolveProviderTokens(c.Request.Context(), provider, req)
+	if err != nil {
+		log.Printf("OAuth %s token resolution failed: %v", provider.Name(), err)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Failed to exchange authorization code"})
+		return
+	}
+
+	identity, err := provider.FetchIdentity(c.Request.Context(), tokens)
+	if err != nil {
+		log.Printf("OAuth %s identity fetch failed: %v", provider.Name(), err)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to fetch identity from provider"})
+		return
+	}
+	applyForwardedName(identity, req)
+
+	// Branch 1: identity already linked -> returning user.
+	var existingIdentity models.UserExternalIdentity
+	found, err := initializers.DB.From("user_external_identity").
+		Select("*").
+		Where(goqu.And(
+			goqu.C("provider").Eq(provider.Name()),
+			goqu.C("provider_user_id").Eq(identity.Sub),
+		)).
+		ScanStruct(&existingIdentity)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to look up identity", "details": err.Error()})
+		return
+	}
+
+	if found {
+		var user models.UserProfile
+		userFound, err := initializers.DB.From("user_profile").
+			Select("*").
+			Where(goqu.C("user_profile_id").Eq(existingIdentity.User_Profile_ID)).
+			ScanStruct(&user)
+		if err != nil || !userFound {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load linked account"})
+			return
+		}
+
+		refreshIdentityRecord(existingIdentity.User_External_Identity_ID, identity, tokens)
+		respondWithSession(c, user, "User logged in successfully.")
+		return
+	}
+
+	// Branch 2: email collision -> pending link + interstitial, never a merge.
+	if identity.Email != "" {
+		var collidingUser models.UserProfile
+		collision, err := initializers.DB.From("user_profile").
+			Select("*").
+			Where(goqu.L("LOWER(email) = LOWER(?)", identity.Email)).
+			ScanStruct(&collidingUser)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check for existing account", "details": err.Error()})
+			return
+		}
+
+		if collision {
+			linkToken, err := createPendingLink(collidingUser.User_Profile_ID, provider.Name(), identity, tokens)
+			if err != nil {
+				log.Printf("Failed to create pending link for user %d: %v", collidingUser.User_Profile_ID, err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start account linking"})
+				return
+			}
+
+			log.Printf("OAuth %s login for sub %s collided with existing account %d; pending link issued",
+				provider.Name(), identity.Sub, collidingUser.User_Profile_ID)
+
+			c.JSON(http.StatusConflict, gin.H{
+				"error":            "An account with this email already exists. Confirm your prayerloop password to link it.",
+				"code":             errCodeEmailCollision,
+				"provider":         provider.Name(),
+				"email":            identity.Email,
+				"pendingLinkToken": linkToken,
+				"expiresInSeconds": int(pendingLinkTTL.Seconds()),
+			})
+			return
+		}
+	}
+
+	// Branch 3: brand-new user -> auto-create + link (scenario 1).
+	user, err := createOAuthUser(provider.Name(), identity, tokens)
+	if err != nil {
+		log.Printf("OAuth %s auto-create failed for sub %s: %v", provider.Name(), identity.Sub, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create account"})
+		return
+	}
+
+	respondWithSession(c, *user, "User created successfully.")
+}
+
+// OAuthConfirmLink handles POST /auth/oauth/:provider/confirm-link.
+// It completes the email-collision interstitial: the user proves ownership of
+// the existing account with their password, and only then is the provider
+// identity linked. Pending links are single-use and expire after 10 minutes.
+func OAuthConfirmLink(c *gin.Context) {
+	// The provider only needs a canonical name here (no provider API calls),
+	// but an unknown slug is still a client error.
+	provider, ok := services.GetOAuthProvider(c.Param("provider"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Unknown or unconfigured OAuth provider"})
+		return
+	}
+
+	var req models.OAuthConfirmLinkRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "pendingLinkToken and password are required", "details": err.Error()})
+		return
+	}
+
+	var pending models.OAuthPendingLink
+	found, err := initializers.DB.From("oauth_pending_link").
+		Select("*").
+		Where(goqu.And(
+			goqu.C("link_token_hash").Eq(hashLinkToken(req.PendingLinkToken)),
+			goqu.C("provider").Eq(provider.Name()),
+		)).
+		ScanStruct(&pending)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to look up pending link", "details": err.Error()})
+		return
+	}
+
+	if !found {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired link token"})
+		return
+	}
+
+	if time.Now().After(pending.Expires_At) {
+		deletePendingLink(pending.OAuth_Pending_Link_ID)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired link token"})
+		return
+	}
+
+	if pending.Attempts >= maxPendingLinkAttempts {
+		deletePendingLink(pending.OAuth_Pending_Link_ID)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Too many attempts. Sign in with your provider again to restart linking."})
+		return
+	}
+
+	var user models.UserProfile
+	userFound, err := initializers.DB.From("user_profile").
+		Select("*").
+		Where(goqu.C("user_profile_id").Eq(pending.User_Profile_ID)).
+		ScanStruct(&user)
+	if err != nil || !userFound {
+		deletePendingLink(pending.OAuth_Pending_Link_ID)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired link token"})
+		return
+	}
+
+	// A NULL password can never authenticate (OAuth-only account). The user
+	// must set a password (forgot-password flow) before linking this way.
+	if user.Password == nil {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "This account has no password. Use 'Forgot Password' to set one, then try linking again.",
+		})
+		return
+	}
+
+	if bcrypt.CompareHashAndPassword([]byte(*user.Password), []byte(req.Password)) != nil {
+		if _, err := initializers.DB.Update("oauth_pending_link").
+			Set(goqu.Record{"attempts": pending.Attempts + 1}).
+			Where(goqu.C("oauth_pending_link_id").Eq(pending.OAuth_Pending_Link_ID)).
+			Executor().Exec(); err != nil {
+			log.Printf("Failed to increment pending link attempts: %v", err)
+		}
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+		return
+	}
+
+	// Password verified: consume the pending link and create the identity
+	// atomically. The DELETE claims the record — a concurrent confirm that
+	// loses the race sees zero rows and is rejected (single-use guarantee).
+	tx, err := initializers.DB.Begin()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete link", "details": err.Error()})
+		return
+	}
+
+	res, err := tx.Delete("oauth_pending_link").
+		Where(goqu.C("oauth_pending_link_id").Eq(pending.OAuth_Pending_Link_ID)).
+		Executor().Exec()
+	if err != nil {
+		if rbErr := tx.Rollback(); rbErr != nil {
+			log.Printf("Failed to rollback transaction: %v", rbErr)
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete link", "details": err.Error()})
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		if rbErr := tx.Rollback(); rbErr != nil {
+			log.Printf("Failed to rollback transaction: %v", rbErr)
+		}
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired link token"})
+		return
+	}
+
+	newIdentity := models.UserExternalIdentity{
+		User_Profile_ID:  pending.User_Profile_ID,
+		Provider:         pending.Provider,
+		Provider_User_ID: pending.Provider_User_ID,
+		Provider_Email:   pending.Provider_Email,
+		Access_Token:     pending.Access_Token,
+		Refresh_Token:    pending.Refresh_Token,
+		Token_Expires_At: pending.Token_Expires_At,
+		Scopes:           pending.Scopes,
+		Organization_ID:  pending.Organization_ID,
+	}
+	if _, err := tx.Insert("user_external_identity").Rows(newIdentity).Executor().Exec(); err != nil {
+		if rbErr := tx.Rollback(); rbErr != nil {
+			log.Printf("Failed to rollback transaction: %v", rbErr)
+		}
+
+		if constraint, isUnique := uniqueViolation(err); isUnique {
+			// Raced against another link of the same provider identity or a
+			// second identity for this account. The pending record survives
+			// the rollback but the situation won't resolve; clean it up.
+			deletePendingLink(pending.OAuth_Pending_Link_ID)
+			if constraint == "uq_uei_user_provider" {
+				c.JSON(http.StatusConflict, gin.H{"error": "This account already has a linked identity for this provider."})
+			} else {
+				c.JSON(http.StatusConflict, gin.H{"error": "This provider identity is already linked to another account."})
+			}
+			return
+		}
+
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete link", "details": err.Error()})
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to complete link", "details": err.Error()})
+		return
+	}
+
+	log.Printf("OAuth %s identity %s linked to account %d via confirm-link",
+		pending.Provider, pending.Provider_User_ID, pending.User_Profile_ID)
+
+	respondWithSession(c, user, "Account linked successfully.")
+}
+
+// OAuthLink handles POST /auth/oauth/:provider/link (scenario 2): a
+// logged-in prayerloop user links an additional provider identity to their
+// account. Unlike OAuthLogin there is no auto-create/email-collision
+// branching — the target account is always currentUser.
+func OAuthLink(c *gin.Context) {
+	currentUser := c.MustGet("currentUser").(models.UserProfile)
+
+	provider, ok := services.GetOAuthProvider(c.Param("provider"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Unknown or unconfigured OAuth provider"})
+		return
+	}
+
+	var req models.OAuthCodeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "idToken, or code and redirect_uri, are required", "details": err.Error()})
+		return
+	}
+	if req.IDToken == "" && (req.Code == "" || req.RedirectURI == "") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "idToken, or code and redirect_uri, are required"})
+		return
+	}
+
+	tokens, err := resolveProviderTokens(c.Request.Context(), provider, req)
+	if err != nil {
+		log.Printf("OAuth %s token resolution failed during link: %v", provider.Name(), err)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Failed to exchange authorization code"})
+		return
+	}
+
+	identity, err := provider.FetchIdentity(c.Request.Context(), tokens)
+	if err != nil {
+		log.Printf("OAuth %s identity fetch failed during link: %v", provider.Name(), err)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to fetch identity from provider"})
+		return
+	}
+	applyForwardedName(identity, req)
+
+	var existingIdentity models.UserExternalIdentity
+	found, err := initializers.DB.From("user_external_identity").
+		Select("*").
+		Where(goqu.And(
+			goqu.C("provider").Eq(provider.Name()),
+			goqu.C("provider_user_id").Eq(identity.Sub),
+		)).
+		ScanStruct(&existingIdentity)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to look up identity", "details": err.Error()})
+		return
+	}
+
+	if found {
+		if existingIdentity.User_Profile_ID != currentUser.User_Profile_ID {
+			c.JSON(http.StatusConflict, gin.H{"error": "This provider identity is already linked to another account."})
+			return
+		}
+
+		// Idempotent: already linked to this account. Refresh the stored
+		// tokens/metadata and return success rather than erroring.
+		refreshIdentityRecord(existingIdentity.User_External_Identity_ID, identity, tokens)
+		respondWithLinkedUser(c, http.StatusOK, currentUser, "Account already linked.")
+		return
+	}
+
+	newIdentity := buildExternalIdentity(currentUser.User_Profile_ID, provider.Name(), identity, tokens)
+	if _, err := initializers.DB.Insert("user_external_identity").Rows(newIdentity).Executor().Exec(); err != nil {
+		if constraint, isUnique := uniqueViolation(err); isUnique {
+			if constraint == "uq_uei_user_provider" {
+				c.JSON(http.StatusConflict, gin.H{"error": "This account already has a linked identity for this provider."})
+			} else {
+				c.JSON(http.StatusConflict, gin.H{"error": "This provider identity is already linked to another account."})
+			}
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to link account", "details": err.Error()})
+		return
+	}
+
+	log.Printf("Linked OAuth %s identity %s to user %d", provider.Name(), identity.Sub, currentUser.User_Profile_ID)
+	respondWithLinkedUser(c, http.StatusOK, currentUser, "Account linked successfully.")
+}
+
+// OAuthUnlink handles DELETE /auth/oauth/:provider/link (scenario 4).
+// Unlink always operates on currentUser from CheckAuth — never a
+// client-supplied id — and is blocked when it would remove the account's
+// only authentication method.
+func OAuthUnlink(c *gin.Context) {
+	currentUser := c.MustGet("currentUser").(models.UserProfile)
+
+	provider, ok := services.GetOAuthProvider(c.Param("provider"))
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Unknown or unconfigured OAuth provider"})
+		return
+	}
+
+	var identity models.UserExternalIdentity
+	found, err := initializers.DB.From("user_external_identity").
+		Select("*").
+		Where(goqu.And(
+			goqu.C("user_profile_id").Eq(currentUser.User_Profile_ID),
+			goqu.C("provider").Eq(provider.Name()),
+		)).
+		ScanStruct(&identity)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to look up identity", "details": err.Error()})
+		return
+	}
+	if !found {
+		c.JSON(http.StatusNotFound, gin.H{"error": "This provider is not linked to your account."})
+		return
+	}
+
+	identityCount, err := initializers.DB.From("user_external_identity").
+		Where(goqu.C("user_profile_id").Eq(currentUser.User_Profile_ID)).
+		Count()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check linked accounts", "details": err.Error()})
+		return
+	}
+
+	if currentUser.Password == nil && identityCount <= 1 {
+		c.JSON(http.StatusConflict, gin.H{"error": "Set a password before unlinking your only sign-in method."})
+		return
+	}
+
+	// Best-effort revoke at the provider before the row (and its tokens) is
+	// deleted. A failed/unavailable revoke must never block the unlink.
+	encrypted := identity.Refresh_Token
+	if encrypted == nil || *encrypted == "" {
+		encrypted = identity.Access_Token
+	}
+	if encrypted != nil && *encrypted != "" {
+		if plaintext, err := services.DecryptToken(*encrypted); err == nil {
+			if err := provider.Revoke(c.Request.Context(), plaintext); err != nil {
+				log.Printf("Best-effort revoke failed for %s identity %d: %v", provider.Name(), identity.User_External_Identity_ID, err)
+			}
+		} else {
+			log.Printf("Failed to decrypt %s token for revocation (identity %d): %v", provider.Name(), identity.User_External_Identity_ID, err)
+		}
+	}
+
+	if _, err := initializers.DB.Delete("user_external_identity").
+		Where(goqu.C("user_external_identity_id").Eq(identity.User_External_Identity_ID)).
+		Executor().Exec(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to unlink account", "details": err.Error()})
+		return
+	}
+
+	log.Printf("Unlinked OAuth %s identity from user %d", provider.Name(), currentUser.User_Profile_ID)
+	respondWithLinkedUser(c, http.StatusOK, currentUser, "Account unlinked successfully.")
+}
+
+// ListUserIdentities handles GET /users/me/identities, returning the
+// provider slugs linked to the caller's account.
+func ListUserIdentities(c *gin.Context) {
+	currentUser := c.MustGet("currentUser").(models.UserProfile)
+
+	providers, err := linkedProviders(currentUser.User_Profile_ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load linked identities", "details": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"linkedProviders": providers})
+}
+
+// linkedProviders returns the provider slugs linked to userID, derived from
+// user_external_identity (never a stored boolean — see planning doc §B Q1).
+func linkedProviders(userID int) ([]string, error) {
+	providers := []string{}
+	if err := initializers.DB.From("user_external_identity").
+		Select("provider").
+		Where(goqu.C("user_profile_id").Eq(userID)).
+		Order(goqu.C("provider").Asc()).
+		ScanVals(&providers); err != nil {
+		return nil, err
+	}
+	return providers, nil
+}
+
+// resolveProviderTokens accepts either shape of models.OAuthCodeRequest: a
+// native SDK identity token (Apple/Google - expo-apple-authentication,
+// @react-native-google-signin/google-signin) or a web/PKCE authorization
+// code (Planning Center). Native tokens skip ExchangeCode entirely -
+// FetchIdentity only ever verifies the ID token locally against the
+// provider's JWKS, so there's no exchange to perform, and a native-issued
+// authorization code couldn't be exchanged server-side anyway: it's scoped
+// to the app's bundle ID, not any client_id/secret this backend holds.
+func resolveProviderTokens(ctx context.Context, provider services.OAuthProvider, req models.OAuthCodeRequest) (*services.ProviderTokens, error) {
+	if req.IDToken != "" {
+		return &services.ProviderTokens{IDToken: req.IDToken}, nil
+	}
+	return provider.ExchangeCode(ctx, req.Code, req.RedirectURI, req.CodeVerifier)
+}
+
+// applyForwardedName overlays a client-forwarded name onto an identity when
+// the provider didn't already supply one. Apple never includes name in the
+// id_token or any endpoint this backend calls - the native SDK hands it to
+// the app directly, and only on the user's first-ever authorization - so
+// this is the only way the backend ever learns it. A no-op for providers
+// (Google, Planning Center) that already populate FirstName/LastName from
+// the verified identity itself.
+func applyForwardedName(identity *services.ProviderIdentity, req models.OAuthCodeRequest) {
+	if identity.FirstName == "" && req.FirstName != "" {
+		identity.FirstName = req.FirstName
+	}
+	if identity.LastName == "" && req.LastName != "" {
+		identity.LastName = req.LastName
+	}
+}
+
+// respondWithLinkedUser writes the standard {message, user} response for
+// OAuthLink/OAuthUnlink, with user decorated by its current linkedProviders.
+func respondWithLinkedUser(c *gin.Context, status int, user models.UserProfile, message string) {
+	providers, err := linkedProviders(user.User_Profile_ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load linked identities", "details": err.Error()})
+		return
+	}
+
+	c.JSON(status, gin.H{
+		"message": message,
+		"user":    models.UserWithLinkedProviders{UserProfile: user, LinkedProviders: providers},
+	})
+}
+
+// respondWithSession issues the standard prayerloop JWT + refresh token
+// response shared by all successful auth paths. Refresh-token issuance is
+// best-effort: a failure there must not fail an otherwise-successful login.
+func respondWithSession(c *gin.Context, user models.UserProfile, message string) {
+	token, err := generateAccessToken(user)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token", "details": err.Error()})
+		return
+	}
+
+	refreshToken, err := issueRefreshToken(user.User_Profile_ID, "")
+	if err != nil {
+		log.Printf("Failed to issue refresh token for user %d: %v", user.User_Profile_ID, err)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":      message,
+		"token":        token,
+		"refreshToken": refreshToken,
+		"user":         user,
+	})
+}
+
+// createPendingLink stores the verified provider identity for the collision
+// interstitial and returns the plaintext one-time token (only its sha256 is
+// persisted).
+func createPendingLink(userID int, providerName string, identity *services.ProviderIdentity, tokens *services.ProviderTokens) (string, error) {
+	// Opportunistic housekeeping: expired records are dead weight.
+	if _, err := initializers.DB.Delete("oauth_pending_link").
+		Where(goqu.C("expires_at").Lt(time.Now())).
+		Executor().Exec(); err != nil {
+		log.Printf("Failed to clean up expired pending links: %v", err)
+	}
+
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("failed to generate link token: %v", err)
+	}
+	linkToken := base64.RawURLEncoding.EncodeToString(raw)
+
+	pending := models.OAuthPendingLink{
+		Link_Token_Hash:  hashLinkToken(linkToken),
+		User_Profile_ID:  userID,
+		Provider:         providerName,
+		Provider_User_ID: identity.Sub,
+		Provider_Email:   nilIfEmpty(identity.Email),
+		Organization_ID:  nilIfEmpty(identity.OrganizationID),
+		Expires_At:       time.Now().Add(pendingLinkTTL),
+	}
+	pending.Access_Token, pending.Refresh_Token, pending.Token_Expires_At, pending.Scopes = encryptProviderTokens(tokens)
+
+	if _, err := initializers.DB.Insert("oauth_pending_link").Rows(pending).Executor().Exec(); err != nil {
+		return "", err
+	}
+	return linkToken, nil
+}
+
+// createOAuthUser auto-creates a prayerloop account for a first-time OAuth
+// login (no email collision). The user_profile, self prayer_subject, and
+// provider identity are created in a single transaction so a failure leaves
+// no partial account. A concurrent duplicate (double-tap) is recovered
+// idempotently by returning the account the other request created — note the
+// race usually surfaces on user_profile's UNIQUE(username)/UNIQUE(email)
+// (both requests synthesize the same username from the provider sub), not on
+// UNIQUE(provider, provider_user_id). The welcome email is deliberately sent
+// after commit: an SMTP call must not hold the transaction open, and a failed
+// email must not roll back the account.
+func createOAuthUser(providerName string, identity *services.ProviderIdentity, tokens *services.ProviderTokens) (*models.UserProfile, error) {
+	username, err := synthesizeUsername(providerName, identity.Sub)
+	if err != nil {
+		return nil, err
+	}
+
+	firstName := identity.FirstName
+	if firstName == "" {
+		if identity.Email != "" {
+			firstName = strings.SplitN(identity.Email, "@", 2)[0]
+		} else {
+			firstName = username
+		}
+	}
+
+	newUser := models.UserProfile{
+		Username:   username,
+		Password:   nil, // OAuth-only account: password login unavailable
+		Email:      identity.Email,
+		First_Name: firstName,
+		Last_Name:  identity.LastName,
+		Created_By: 1,
+		Updated_By: 1,
+	}
+
+	tx, err := initializers.DB.Begin()
+	if err != nil {
+		return nil, err
+	}
+
+	var insertedUserID int
+	if _, err := tx.Insert("user_profile").Rows(newUser).Returning("user_profile_id").Executor().ScanVal(&insertedUserID); err != nil {
+		if rbErr := tx.Rollback(); rbErr != nil {
+			log.Printf("Failed to rollback transaction: %v", rbErr)
+		}
+		if _, isUnique := uniqueViolation(err); isUnique {
+			// Concurrent double-tap: the other request committed first and
+			// owns the synthesized username (and possibly the email). If it
+			// linked this same (provider, sub), return its account. If not
+			// (an unrelated username/email race), fall through to the error —
+			// returning some other user here would be a silent merge.
+			if existing, lookupErr := lookupUserByIdentity(providerName, identity.Sub); lookupErr == nil {
+				return existing, nil
+			}
+		}
+		return nil, fmt.Errorf("failed to insert user_profile: %v", err)
+	}
+
+	txUser := newUser
+	txUser.User_Profile_ID = insertedUserID
+	if _, err := getOrCreateSelfPrayerSubject(tx, txUser); err != nil {
+		if rbErr := tx.Rollback(); rbErr != nil {
+			log.Printf("Failed to rollback transaction: %v", rbErr)
+		}
+		return nil, fmt.Errorf("failed to create self prayer_subject: %v", err)
+	}
+
+	newIdentity := buildExternalIdentity(insertedUserID, providerName, identity, tokens)
+	if _, err := tx.Insert("user_external_identity").Rows(newIdentity).Executor().Exec(); err != nil {
+		if rbErr := tx.Rollback(); rbErr != nil {
+			log.Printf("Failed to rollback transaction: %v", rbErr)
+		}
+		if _, isUnique := uniqueViolation(err); isUnique {
+			// Concurrent request already created and linked this identity.
+			return lookupUserByIdentity(providerName, identity.Sub)
+		}
+		return nil, fmt.Errorf("failed to insert user_external_identity: %v", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	var createdUser models.UserProfile
+	found, err := initializers.DB.From("user_profile").
+		Select("*").
+		Where(goqu.C("user_profile_id").Eq(insertedUserID)).
+		ScanStruct(&createdUser)
+	if err != nil || !found {
+		return nil, fmt.Errorf("failed to load created user %d: %v", insertedUserID, err)
+	}
+
+	if createdUser.Email != "" {
+		if emailService := services.GetEmailService(); emailService != nil {
+			if err := emailService.SendWelcomeEmail(createdUser.Email, createdUser.First_Name); err != nil {
+				log.Printf("Failed to send welcome email to %s: %v", createdUser.Email, err)
+			}
+		}
+	}
+
+	log.Printf("Auto-created user %d from OAuth %s sub %s", insertedUserID, providerName, identity.Sub)
+	return &createdUser, nil
+}
+
+func lookupUserByIdentity(providerName, sub string) (*models.UserProfile, error) {
+	var identity models.UserExternalIdentity
+	found, err := initializers.DB.From("user_external_identity").
+		Select("*").
+		Where(goqu.And(
+			goqu.C("provider").Eq(providerName),
+			goqu.C("provider_user_id").Eq(sub),
+		)).
+		ScanStruct(&identity)
+	if err != nil || !found {
+		return nil, fmt.Errorf("identity lookup after unique violation failed: %v", err)
+	}
+
+	var user models.UserProfile
+	found, err = initializers.DB.From("user_profile").
+		Select("*").
+		Where(goqu.C("user_profile_id").Eq(identity.User_Profile_ID)).
+		ScanStruct(&user)
+	if err != nil || !found {
+		return nil, fmt.Errorf("user lookup after unique violation failed: %v", err)
+	}
+	return &user, nil
+}
+
+// refreshIdentityRecord updates the stored provider metadata/tokens on a
+// returning login. Failures are non-fatal — the login itself already succeeded.
+func refreshIdentityRecord(identityID int, identity *services.ProviderIdentity, tokens *services.ProviderTokens) {
+	record := goqu.Record{
+		"provider_email":  nilIfEmpty(identity.Email),
+		"organization_id": nilIfEmpty(identity.OrganizationID),
+	}
+	if accessToken, refreshToken, expiresAt, scopes := encryptProviderTokens(tokens); accessToken != nil {
+		record["access_token"] = accessToken
+		record["refresh_token"] = refreshToken
+		record["token_expires_at"] = expiresAt
+		record["scopes"] = scopes
+	}
+
+	if _, err := initializers.DB.Update("user_external_identity").
+		Set(record).
+		Where(goqu.C("user_external_identity_id").Eq(identityID)).
+		Executor().Exec(); err != nil {
+		log.Printf("Failed to refresh identity record %d: %v", identityID, err)
+	}
+}
+
+func buildExternalIdentity(userID int, providerName string, identity *services.ProviderIdentity, tokens *services.ProviderTokens) models.UserExternalIdentity {
+	rec := models.UserExternalIdentity{
+		User_Profile_ID:  userID,
+		Provider:         providerName,
+		Provider_User_ID: identity.Sub,
+		Provider_Email:   nilIfEmpty(identity.Email),
+		Organization_ID:  nilIfEmpty(identity.OrganizationID),
+	}
+	rec.Access_Token, rec.Refresh_Token, rec.Token_Expires_At, rec.Scopes = encryptProviderTokens(tokens)
+	return rec
+}
+
+// encryptProviderTokens encrypts provider tokens for storage. When encryption
+// is unavailable (no OAUTH_TOKEN_ENC_KEY) everything is nil — plaintext
+// provider tokens are never persisted.
+func encryptProviderTokens(tokens *services.ProviderTokens) (accessToken, refreshToken *string, expiresAt *time.Time, scopes *string) {
+	if tokens == nil || !services.TokenEncryptionAvailable() {
+		return nil, nil, nil, nil
+	}
+
+	if tokens.AccessToken != "" {
+		if enc, err := services.EncryptToken(tokens.AccessToken); err == nil {
+			accessToken = &enc
+		} else {
+			log.Printf("Failed to encrypt access token: %v", err)
+			return nil, nil, nil, nil
+		}
+	}
+	if tokens.RefreshToken != "" {
+		if enc, err := services.EncryptToken(tokens.RefreshToken); err == nil {
+			refreshToken = &enc
+		} else {
+			log.Printf("Failed to encrypt refresh token: %v", err)
+			return nil, nil, nil, nil
+		}
+	}
+	expiresAt = tokens.ExpiresAt
+	scopes = nilIfEmpty(tokens.Scopes)
+	return accessToken, refreshToken, expiresAt, scopes
+}
+
+// synthesizeUsername builds a unique username for an auto-created OAuth
+// account (username is NOT NULL UNIQUE and there is no rename path yet).
+func synthesizeUsername(providerName, sub string) (string, error) {
+	prefixes := map[string]string{
+		"planning_center": "pc",
+		"google":          "google",
+		"apple":           "apple",
+	}
+	prefix, ok := prefixes[providerName]
+	if !ok {
+		prefix = providerName
+	}
+
+	username := fmt.Sprintf("%s_%s", prefix, sub)
+	count, err := initializers.DB.From("user_profile").
+		Select("username").
+		Where(goqu.C("username").Eq(username)).
+		Count()
+	if err != nil {
+		return "", err
+	}
+	if count == 0 {
+		return username, nil
+	}
+
+	suffix := make([]byte, 3)
+	if _, err := rand.Read(suffix); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s_%s", username, hex.EncodeToString(suffix)), nil
+}
+
+func deletePendingLink(id int) {
+	if _, err := initializers.DB.Delete("oauth_pending_link").
+		Where(goqu.C("oauth_pending_link_id").Eq(id)).
+		Executor().Exec(); err != nil {
+		log.Printf("Failed to delete pending link %d: %v", id, err)
+	}
+}
+
+func hashLinkToken(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+func nilIfEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+// uniqueViolation reports whether err is a Postgres unique-constraint
+// violation, returning the constraint name when available.
+func uniqueViolation(err error) (string, bool) {
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) && pqErr.Code == "23505" {
+		return pqErr.Constraint, true
+	}
+	return "", false
+}
+
+// revokeIdentityTokens best-effort revokes every OAuth provider token linked
+// to userID. Called by DeleteUserAccount before it deletes the
+// user_external_identity rows below — Apple mandates revoke-on-delete, and
+// doing this generically means Google/Apple get it for free once those
+// providers ship. A failed or unavailable revoke must never block account
+// deletion, so every error here is logged and swallowed.
+func revokeIdentityTokens(ctx context.Context, userID int) {
+	var identities []models.UserExternalIdentity
+	if err := initializers.DB.From("user_external_identity").
+		Select("*").
+		Where(goqu.C("user_profile_id").Eq(userID)).
+		ScanStructs(&identities); err != nil {
+		if !strings.Contains(err.Error(), "does not exist") {
+			log.Printf("Failed to load external identities for revocation (user %d): %v", userID, err)
+		}
+		return
+	}
+
+	for _, identity := range identities {
+		provider, ok := services.GetOAuthProvider(identity.Provider)
+		if !ok {
+			continue
+		}
+
+		// Revoking the refresh token invalidates the whole grant; fall back
+		// to the access token if no refresh token was stored.
+		encrypted := identity.Refresh_Token
+		if encrypted == nil || *encrypted == "" {
+			encrypted = identity.Access_Token
+		}
+		if encrypted == nil || *encrypted == "" {
+			continue
+		}
+
+		plaintext, err := services.DecryptToken(*encrypted)
+		if err != nil {
+			log.Printf("Failed to decrypt %s token for revocation (identity %d): %v",
+				identity.Provider, identity.User_External_Identity_ID, err)
+			continue
+		}
+
+		if err := provider.Revoke(ctx, plaintext); err != nil {
+			log.Printf("Best-effort revoke failed for %s identity %d: %v",
+				identity.Provider, identity.User_External_Identity_ID, err)
+		}
+	}
+}
+
+// RefreshAccessToken handles POST /auth/refresh. It validates and rotates a
+// presented prayerloop refresh token, returning a fresh JWT + refresh token
+// pair. Reuse of an already-rotated/revoked token revokes its entire family
+// (theft resistance) and is rejected.
+func RefreshAccessToken(c *gin.Context) {
+	var req models.RefreshTokenRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "refreshToken is required", "details": err.Error()})
+		return
+	}
+
+	record, newRefreshToken, err := validateAndRotateRefreshToken(req.RefreshToken)
+	if err != nil {
+		if errors.Is(err, errInvalidRefreshToken) || errors.Is(err, errRefreshTokenReused) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired refresh token"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to refresh session", "details": err.Error()})
+		return
+	}
+
+	var user models.UserProfile
+	found, err := initializers.DB.From("user_profile").
+		Select("*").
+		Where(goqu.C("user_profile_id").Eq(record.User_Profile_ID)).
+		ScanStruct(&user)
+	if err != nil || !found {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid or expired refresh token"})
+		return
+	}
+
+	token, err := generateAccessToken(user)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate token", "details": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"token":        token,
+		"refreshToken": newRefreshToken,
+		"user":         user,
+	})
+}
+
+// RevokeRefreshToken handles POST /auth/logout. It revokes the presented
+// refresh token; unknown/already-revoked tokens are treated as success so
+// logout is idempotent. The JWT itself remains valid until its natural
+// expiry (<=24h) — "log out all devices" is not yet supported.
+func RevokeRefreshToken(c *gin.Context) {
+	var req models.RefreshTokenRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "refreshToken is required", "details": err.Error()})
+		return
+	}
+
+	if err := revokeRefreshToken(req.RefreshToken); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to log out", "details": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Logged out successfully."})
+}
