@@ -67,6 +67,7 @@ func CreateGroupInviteCode(c *gin.Context) {
 
 func JoinGroup(c *gin.Context) {
 	currentUser := c.MustGet("currentUser").(models.UserProfile)
+	isAdmin := c.MustGet("admin").(bool)
 
 	groupID, err := strconv.Atoi(c.Param("group_profile_id"))
 	if err != nil {
@@ -119,6 +120,22 @@ func JoinGroup(c *gin.Context) {
 
 	if isUserInGroup(c, groupID) {
 		c.JSON(http.StatusConflict, gin.H{"error": "You are already in this group"})
+		return
+	}
+
+	underLimit, currentCount, err := isUnderCircleLimit(currentUser.User_Profile_ID, isAdmin)
+	if err != nil {
+		log.Println(err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check circle limit", "details": err.Error()})
+		return
+	}
+	if !underLimit {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":   "You have reached the free circle limit. Upgrade to prayerloop Infinite to join more prayer circles.",
+			"code":    "CIRCLE_LIMIT_REACHED",
+			"limit":   FreeCircleLimit,
+			"current": currentCount,
+		})
 		return
 	}
 

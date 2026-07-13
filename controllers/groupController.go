@@ -17,6 +17,23 @@ import (
 
 func CreateGroup(c *gin.Context) {
 	user := c.MustGet("currentUser").(models.UserProfile)
+	isAdmin := c.MustGet("admin").(bool)
+
+	underLimit, currentCount, err := isUnderCircleLimit(user.User_Profile_ID, isAdmin)
+	if err != nil {
+		log.Println(err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check circle limit", "details": err.Error()})
+		return
+	}
+	if !underLimit {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":   "You have reached the free prayer circle limit. Upgrade to prayerloop Infinite to create more prayer circles.",
+			"code":    "CIRCLE_LIMIT_REACHED",
+			"limit":   FreeCircleLimit,
+			"current": currentCount,
+		})
+		return
+	}
 
 	var newGroup models.GroupCreate
 	if err := c.BindJSON(&newGroup); err != nil {
@@ -37,7 +54,7 @@ func CreateGroup(c *gin.Context) {
 	groupInsert := initializers.DB.Insert("group_profile").Rows(group).Returning("group_profile_id")
 
 	var insertedID int
-	_, err := groupInsert.Executor().ScanVal(&insertedID)
+	_, err = groupInsert.Executor().ScanVal(&insertedID)
 	if err != nil {
 		log.Println(err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create group", "details": err.Error()})
