@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/PrayerLoop/models"
@@ -229,6 +230,190 @@ func TestRevenueCatWebhook_SubscriptionUpsertFails_RollsBackAndReturns500(t *tes
 	mock.ExpectRollback()
 
 	RevenueCatWebhook(c)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+var userSubscriptionColumns = []string{
+	"user_subscription_id", "user_profile_id", "is_premium", "entitlement_id",
+	"product_id", "store", "period_type", "expires_at", "will_renew",
+	"revenuecat_app_user_id", "last_event_type", "last_event_at",
+	"datetime_create", "datetime_update",
+}
+
+func TestGetMySubscription_RowFound(t *testing.T) {
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	now := time.Now()
+	entitlementID := "premium"
+	productID := "prayerloop_premium_monthly"
+	store := "app_store"
+	periodType := "NORMAL"
+	willRenew := true
+	lastEventType := "INITIAL_PURCHASE"
+	rows := sqlmock.NewRows(userSubscriptionColumns).
+		AddRow(1, 1, true, entitlementID, productID, store, periodType, now, willRenew, "1", lastEventType, now, now, now)
+	mock.ExpectQuery("SELECT").WillReturnRows(rows)
+
+	c, w := SetupTestContext()
+	SetAuthenticatedUser(c, MockUser(), false)
+	c.Request = httptest.NewRequest(http.MethodGet, "/users/me/subscription", nil)
+
+	GetMySubscription(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var response map[string]interface{}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Equal(t, true, response["isPremium"])
+	assert.Equal(t, entitlementID, response["entitlementId"])
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestGetMySubscription_NoRow_DefaultsToFreeTier(t *testing.T) {
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows(userSubscriptionColumns))
+
+	c, w := SetupTestContext()
+	SetAuthenticatedUser(c, MockUser(), false)
+	c.Request = httptest.NewRequest(http.MethodGet, "/users/me/subscription", nil)
+
+	GetMySubscription(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.JSONEq(t, `{"isPremium": false}`, w.Body.String())
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestGetMySubscription_DBError(t *testing.T) {
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	mock.ExpectQuery("SELECT").WillReturnError(sqlmock.ErrCancelled)
+
+	c, w := SetupTestContext()
+	SetAuthenticatedUser(c, MockUser(), false)
+	c.Request = httptest.NewRequest(http.MethodGet, "/users/me/subscription", nil)
+
+	GetMySubscription(c)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+// withRCSubscriberServer stands up an httptest server returning the given
+// body for GET /v1/subscribers/{app_user_id}, points services.FetchSubscriber
+// at it for the duration of the test, and configures REVENUECAT_SECRET_API_KEY.
+func withRCSubscriberServer(t *testing.T, status int, body string) {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(status)
+		w.Write([]byte(body))
+	}))
+	t.Cleanup(server.Close)
+
+	restoreURL := services.SetRevenueCatSubscribersURLForTesting(server.URL + "/")
+	t.Cleanup(restoreURL)
+
+	os.Setenv("REVENUECAT_SECRET_API_KEY", "sk_test")
+	t.Cleanup(func() { os.Unsetenv("REVENUECAT_SECRET_API_KEY") })
+}
+
+func TestSyncSubscription_Success(t *testing.T) {
+	withRCSubscriberServer(t, http.StatusOK, `{
+		"subscriber": {
+			"entitlements": {
+				"premium": {
+					"expires_date": "2099-01-01T00:00:00Z",
+					"product_identifier": "prayerloop_premium_monthly"
+				}
+			},
+			"subscriptions": {
+				"prayerloop_premium_monthly": {
+					"expires_date": "2099-01-01T00:00:00Z",
+					"store": "app_store",
+					"period_type": "normal"
+				}
+			}
+		}
+	}`)
+
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	now := time.Now()
+	entitlementID := "premium"
+	productID := "prayerloop_premium_monthly"
+	store := "app_store"
+	periodType := "NORMAL"
+	willRenew := true
+	rows := sqlmock.NewRows(userSubscriptionColumns).
+		AddRow(1, 1, true, entitlementID, productID, store, periodType, now, willRenew, "1", "SYNC", now, now, now)
+	mock.ExpectQuery(`INSERT INTO "user_subscription"`).WillReturnRows(rows)
+
+	c, w := SetupTestContext()
+	SetAuthenticatedUser(c, MockUser(), false)
+	c.Request = httptest.NewRequest(http.MethodPost, "/users/me/subscription/sync", nil)
+
+	SyncSubscription(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var response map[string]interface{}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Equal(t, true, response["isPremium"])
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestSyncSubscription_UpsertReturnsNoRow(t *testing.T) {
+	withRCSubscriberServer(t, http.StatusOK, `{"subscriber": {"entitlements": {}, "subscriptions": {}}}`)
+
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	mock.ExpectQuery(`INSERT INTO "user_subscription"`).WillReturnRows(sqlmock.NewRows(userSubscriptionColumns))
+
+	c, w := SetupTestContext()
+	SetAuthenticatedUser(c, MockUser(), false)
+	c.Request = httptest.NewRequest(http.MethodPost, "/users/me/subscription/sync", nil)
+
+	SyncSubscription(c)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestSyncSubscription_RevenueCatUnreachable(t *testing.T) {
+	withRCSubscriberServer(t, http.StatusInternalServerError, `{}`)
+
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	c, w := SetupTestContext()
+	SetAuthenticatedUser(c, MockUser(), false)
+	c.Request = httptest.NewRequest(http.MethodPost, "/users/me/subscription/sync", nil)
+
+	SyncSubscription(c)
+
+	assert.Equal(t, http.StatusBadGateway, w.Code)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestSyncSubscription_UpsertFails(t *testing.T) {
+	withRCSubscriberServer(t, http.StatusOK, `{"subscriber": {"entitlements": {}, "subscriptions": {}}}`)
+
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	mock.ExpectQuery(`INSERT INTO "user_subscription"`).WillReturnError(sqlmock.ErrCancelled)
+
+	c, w := SetupTestContext()
+	SetAuthenticatedUser(c, MockUser(), false)
+	c.Request = httptest.NewRequest(http.MethodPost, "/users/me/subscription/sync", nil)
+
+	SyncSubscription(c)
 
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
 	assert.NoError(t, mock.ExpectationsWereMet())

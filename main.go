@@ -82,6 +82,10 @@ func main() {
 		auth.POST("/auth/oauth/:provider/link", controllers.OAuthLink)
 		auth.DELETE("/auth/oauth/:provider/link", controllers.OAuthUnlink)
 
+		// RevenueCat subscription state (issue #42)
+		auth.GET("/users/me/subscription", controllers.GetMySubscription)
+		auth.POST("/users/me/subscription/sync", controllers.SyncSubscription)
+
 		auth.GET("/users/:user_profile_id/groups", controllers.GetUserGroups)
 		auth.PATCH("/users/:user_profile_id/groups/reorder", controllers.ReorderUserGroups)
 

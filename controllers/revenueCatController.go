@@ -208,3 +208,105 @@ func msToTime(ms *int64) *time.Time {
 	t := time.UnixMilli(*ms)
 	return &t
 }
+
+// rcEventTypeSync marks a user_subscription row whose last update came from
+// the /sync REST pull below rather than a webhook delivery. last_event_type
+// has no DB CHECK constraint (free-form VARCHAR), and this table already has
+// a non-webhook sentinel precedent: the LEGACY_GRANDFATHER backfill from
+// migration 029.
+const rcEventTypeSync = "SYNC"
+
+// GetMySubscription handles GET /users/me/subscription. Reads the cached
+// user_subscription row only -- it never calls out to RevenueCat itself (see
+// SyncSubscription below for the one endpoint that does). A missing row
+// means free tier: user_subscription doesn't require a row per user.
+func GetMySubscription(c *gin.Context) {
+	currentUser := c.MustGet("currentUser").(models.UserProfile)
+
+	var sub models.UserSubscription
+	found, err := initializers.DB.From("user_subscription").
+		Where(goqu.C("user_profile_id").Eq(currentUser.User_Profile_ID)).
+		ScanStruct(&sub)
+	if err != nil {
+		log.Printf("Failed to fetch subscription for user %d: %v", currentUser.User_Profile_ID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch subscription"})
+		return
+	}
+	if !found {
+		c.JSON(http.StatusOK, gin.H{"isPremium": false})
+		return
+	}
+
+	c.JSON(http.StatusOK, sub)
+}
+
+// SyncSubscription handles POST /users/me/subscription/sync. RevenueCat's
+// webhook delivery is async, so a client that just completed a purchase (or
+// tapped Restore Purchases) can race the webhook: this endpoint asks
+// RevenueCat directly, right now, and upserts user_subscription from the
+// answer -- closing that gap without waiting on the delivery.
+func SyncSubscription(c *gin.Context) {
+	currentUser := c.MustGet("currentUser").(models.UserProfile)
+	appUserID := strconv.Itoa(currentUser.User_Profile_ID)
+
+	info, err := services.FetchSubscriber(c, appUserID)
+	if err != nil {
+		log.Printf("Failed to sync subscription for user %d: %v", currentUser.User_Profile_ID, err)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Failed to sync subscription with RevenueCat"})
+		return
+	}
+
+	now := time.Now()
+	fields := goqu.Record{
+		"user_profile_id":        currentUser.User_Profile_ID,
+		"revenuecat_app_user_id": info.AppUserID,
+		"is_premium":             info.IsPremium,
+		"entitlement_id":         info.EntitlementID,
+		"product_id":             info.ProductID,
+		"store":                  info.Store,
+		"period_type":            info.PeriodType,
+		"expires_at":             info.ExpiresAt,
+		"will_renew":             info.WillRenew,
+		"last_event_type":        rcEventTypeSync,
+		"last_event_at":          now,
+	}
+
+	// Returning the upserted row directly (rather than a separate reload
+	// SELECT) keeps this atomic with the write -- a reload would otherwise
+	// race a concurrent RevenueCatWebhook upsert for the same user_profile_id
+	// and could hand the caller a row this request didn't actually write.
+	var sub models.UserSubscription
+	found, err := initializers.DB.Insert("user_subscription").
+		Rows(fields).
+		OnConflict(goqu.DoUpdate("user_profile_id", goqu.Record{
+			"revenuecat_app_user_id": info.AppUserID,
+			"is_premium":             info.IsPremium,
+			"entitlement_id":         info.EntitlementID,
+			"product_id":             info.ProductID,
+			"store":                  info.Store,
+			"period_type":            info.PeriodType,
+			"expires_at":             info.ExpiresAt,
+			"will_renew":             info.WillRenew,
+			"last_event_type":        rcEventTypeSync,
+			"last_event_at":          now,
+		})).
+		Returning(
+			"user_subscription_id", "user_profile_id", "is_premium", "entitlement_id",
+			"product_id", "store", "period_type", "expires_at", "will_renew",
+			"revenuecat_app_user_id", "last_event_type", "last_event_at",
+			"datetime_create", "datetime_update",
+		).
+		Executor().ScanStruct(&sub)
+	if err != nil {
+		log.Printf("Failed to upsert subscription for user %d: %v", currentUser.User_Profile_ID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save subscription"})
+		return
+	}
+	if !found {
+		log.Printf("Upsert for user %d returned no row", currentUser.User_Profile_ID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save subscription"})
+		return
+	}
+
+	c.JSON(http.StatusOK, sub)
+}
