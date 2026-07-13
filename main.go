@@ -17,6 +17,7 @@ func init() {
 	services.InitPushNotificationService()
 	services.InitEmailService()
 	services.InitOAuthService()
+	services.InitRevenueCatService()
 }
 
 func main() {
@@ -54,6 +55,12 @@ func main() {
 	// Server-side refresh tokens (shared by password and OAuth logins)
 	router.POST("/auth/refresh", middlewares.RateLimitMiddleware(5, 5, getKey), controllers.RefreshAccessToken)
 	router.POST("/auth/logout", middlewares.RateLimitMiddleware(5, 5, getKey), controllers.RevokeRefreshToken)
+
+	// RevenueCat webhook receiver: no CheckAuth (RC can't send a prayerloop
+	// JWT) and no RateLimitMiddleware (RC retries non-200 responses with
+	// backoff, so throttling risks silently losing events). Authenticity
+	// comes from signature verification inside the handler instead.
+	router.POST("/webhooks/revenuecat", controllers.RevenueCatWebhook)
 
 	// Test endpoint for email service (remove in production)
 	router.POST("/test/email", middlewares.RateLimitMiddleware(2, 2, getKey), controllers.TestEmailService)
