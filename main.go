@@ -17,6 +17,7 @@ func init() {
 	services.InitPushNotificationService()
 	services.InitEmailService()
 	services.InitOAuthService()
+	services.InitRevenueCatService()
 }
 
 func main() {
@@ -55,6 +56,12 @@ func main() {
 	router.POST("/auth/refresh", middlewares.RateLimitMiddleware(5, 5, getKey), controllers.RefreshAccessToken)
 	router.POST("/auth/logout", middlewares.RateLimitMiddleware(5, 5, getKey), controllers.RevokeRefreshToken)
 
+	// RevenueCat webhook receiver: no CheckAuth (RC can't send a prayerloop
+	// JWT) and no RateLimitMiddleware (RC retries non-200 responses with
+	// backoff, so throttling risks silently losing events). Authenticity
+	// comes from signature verification inside the handler instead.
+	router.POST("/webhooks/revenuecat", controllers.RevenueCatWebhook)
+
 	// Test endpoint for email service (remove in production)
 	router.POST("/test/email", middlewares.RateLimitMiddleware(2, 2, getKey), controllers.TestEmailService)
 
@@ -74,6 +81,10 @@ func main() {
 		// OAuth account linking/unlinking (scenarios 2 & 4)
 		auth.POST("/auth/oauth/:provider/link", controllers.OAuthLink)
 		auth.DELETE("/auth/oauth/:provider/link", controllers.OAuthUnlink)
+
+		// RevenueCat subscription state (issue #42)
+		auth.GET("/users/me/subscription", controllers.GetMySubscription)
+		auth.POST("/users/me/subscription/sync", controllers.SyncSubscription)
 
 		auth.GET("/users/:user_profile_id/groups", controllers.GetUserGroups)
 		auth.PATCH("/users/:user_profile_id/groups/reorder", controllers.ReorderUserGroups)
