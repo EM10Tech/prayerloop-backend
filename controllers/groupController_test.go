@@ -19,7 +19,10 @@ func TestCreateGroup(t *testing.T) {
 	tests := []struct {
 		name           string
 		currentUser    models.UserProfile
+		isAdmin        bool
 		groupData      models.GroupCreate
+		circleCount    int
+		isPremium      bool
 		expectedStatus int
 		expectError    bool
 	}{
@@ -30,6 +33,7 @@ func TestCreateGroup(t *testing.T) {
 				Group_Name:        "Prayer Warriors",
 				Group_Description: "A group for prayer warriors",
 			},
+			circleCount:    0,
 			expectedStatus: http.StatusCreated,
 			expectError:    false,
 		},
@@ -40,8 +44,44 @@ func TestCreateGroup(t *testing.T) {
 				Group_Name:        "Test Group",
 				Group_Description: "",
 			},
+			circleCount:    2,
 			expectedStatus: http.StatusCreated,
 			expectError:    false,
+		},
+		{
+			name:        "premium user bypasses circle limit",
+			currentUser: MockUser(),
+			groupData: models.GroupCreate{
+				Group_Name:        "Fourth Circle",
+				Group_Description: "",
+			},
+			circleCount:    3,
+			isPremium:      true,
+			expectedStatus: http.StatusCreated,
+			expectError:    false,
+		},
+		{
+			name:        "admin bypasses circle limit",
+			currentUser: MockAdminUser(),
+			isAdmin:     true,
+			groupData: models.GroupCreate{
+				Group_Name:        "Admin Circle",
+				Group_Description: "",
+			},
+			expectedStatus: http.StatusCreated,
+			expectError:    false,
+		},
+		{
+			name:        "free user at circle limit is rejected",
+			currentUser: MockUser(),
+			groupData: models.GroupCreate{
+				Group_Name:        "One Too Many",
+				Group_Description: "",
+			},
+			circleCount:    3,
+			isPremium:      false,
+			expectedStatus: http.StatusForbidden,
+			expectError:    true,
 		},
 	}
 
@@ -49,6 +89,18 @@ func TestCreateGroup(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			_, mock, cleanup := SetupTestDB(t)
 			defer cleanup()
+
+			if !tt.isAdmin {
+				// Mock circle limit check: active circle count, then premium lookup
+				mock.ExpectQuery("SELECT COUNT").
+					WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(tt.circleCount))
+				premiumRows := sqlmock.NewRows([]string{"is_premium"})
+				if tt.isPremium {
+					premiumRows.AddRow(true)
+				}
+				mock.ExpectQuery("SELECT \"is_premium\" FROM \"user_subscription\"").
+					WillReturnRows(premiumRows)
+			}
 
 			if !tt.expectError {
 				// Mock group insert - return group ID
@@ -73,7 +125,7 @@ func TestCreateGroup(t *testing.T) {
 			}
 
 			c, w := SetupTestContext()
-			SetAuthenticatedUser(c, tt.currentUser, false)
+			SetAuthenticatedUser(c, tt.currentUser, tt.isAdmin)
 			jsonData, _ := json.Marshal(tt.groupData)
 			c.Request = httptest.NewRequest("POST", "/groups", bytes.NewBuffer(jsonData))
 			c.Request.Header.Set("Content-Type", "application/json")

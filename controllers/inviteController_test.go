@@ -136,6 +136,7 @@ func TestJoinGroup(t *testing.T) {
 		name           string
 		groupID        string
 		currentUser    models.UserProfile
+		isAdmin        bool
 		inviteCode     string
 		inviteValid    bool
 		inviteExpired  bool
@@ -144,6 +145,8 @@ func TestJoinGroup(t *testing.T) {
 		userInGroup    bool
 		groupExists    bool
 		invalidJSON    bool
+		circleCount    int
+		isPremium      bool
 		expectedStatus int
 		expectError    bool
 	}{
@@ -282,6 +285,56 @@ func TestJoinGroup(t *testing.T) {
 			expectedStatus: http.StatusBadRequest,
 			expectError:    true,
 		},
+		{
+			name:           "free user at circle limit is rejected",
+			groupID:        "1",
+			currentUser:    MockUser(),
+			inviteCode:     "0001-A4F2",
+			inviteValid:    true,
+			inviteExpired:  false,
+			inviteInactive: false,
+			wrongGroup:     false,
+			userInGroup:    false,
+			groupExists:    true,
+			invalidJSON:    false,
+			circleCount:    3,
+			isPremium:      false,
+			expectedStatus: http.StatusForbidden,
+			expectError:    true,
+		},
+		{
+			name:           "premium user bypasses circle limit",
+			groupID:        "1",
+			currentUser:    MockUser(),
+			inviteCode:     "0001-A4F2",
+			inviteValid:    true,
+			inviteExpired:  false,
+			inviteInactive: false,
+			wrongGroup:     false,
+			userInGroup:    false,
+			groupExists:    true,
+			invalidJSON:    false,
+			circleCount:    3,
+			isPremium:      true,
+			expectedStatus: http.StatusOK,
+			expectError:    false,
+		},
+		{
+			name:           "admin bypasses circle limit",
+			groupID:        "1",
+			currentUser:    MockAdminUser(),
+			isAdmin:        true,
+			inviteCode:     "0001-A4F2",
+			inviteValid:    true,
+			inviteExpired:  false,
+			inviteInactive: false,
+			wrongGroup:     false,
+			userInGroup:    false,
+			groupExists:    true,
+			invalidJSON:    false,
+			expectedStatus: http.StatusOK,
+			expectError:    false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -327,25 +380,41 @@ func TestJoinGroup(t *testing.T) {
 							} else {
 								mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 
-								// Mock display sequence update
-								mock.ExpectExec("UPDATE \"user_group\"").
-									WillReturnResult(sqlmock.NewResult(0, 0))
+								// Mock circle limit check: active circle count, then premium lookup
+								atCircleLimit := false
+								if !tt.isAdmin {
+									mock.ExpectQuery("SELECT COUNT").
+										WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(tt.circleCount))
+									premiumRows := sqlmock.NewRows([]string{"is_premium"})
+									if tt.isPremium {
+										premiumRows.AddRow(true)
+									}
+									mock.ExpectQuery("SELECT \"is_premium\" FROM \"user_subscription\"").
+										WillReturnRows(premiumRows)
+									atCircleLimit = tt.circleCount >= FreeCircleLimit && !tt.isPremium
+								}
 
-								// Mock user_group insert
-								mock.ExpectExec("INSERT INTO \"user_group\"").
-									WillReturnResult(sqlmock.NewResult(1, 1))
+								if !atCircleLimit {
+									// Mock display sequence update
+									mock.ExpectExec("UPDATE \"user_group\"").
+										WillReturnResult(sqlmock.NewResult(0, 0))
 
-								// Mock invite deactivation
-								mock.ExpectExec("UPDATE \"group_invite\"").
-									WillReturnResult(sqlmock.NewResult(0, 1))
+									// Mock user_group insert
+									mock.ExpectExec("INSERT INTO \"user_group\"").
+										WillReturnResult(sqlmock.NewResult(1, 1))
 
-								// Mock GetGroupNameByID for push notification (runs in goroutine)
-								mock.ExpectQuery("SELECT \"group_name\" FROM \"group_profile\"").
-									WillReturnRows(sqlmock.NewRows([]string{"group_name"}).AddRow("Test Group"))
+									// Mock invite deactivation
+									mock.ExpectExec("UPDATE \"group_invite\"").
+										WillReturnResult(sqlmock.NewResult(0, 1))
 
-								// Mock GetOtherGroupMemberIDs for push notification (runs in goroutine)
-								mock.ExpectQuery("SELECT \"user_profile_id\" FROM \"user_group\"").
-									WillReturnRows(sqlmock.NewRows([]string{"user_profile_id"}).AddRow(2).AddRow(3))
+									// Mock GetGroupNameByID for push notification (runs in goroutine)
+									mock.ExpectQuery("SELECT \"group_name\" FROM \"group_profile\"").
+										WillReturnRows(sqlmock.NewRows([]string{"group_name"}).AddRow("Test Group"))
+
+									// Mock GetOtherGroupMemberIDs for push notification (runs in goroutine)
+									mock.ExpectQuery("SELECT \"user_profile_id\" FROM \"user_group\"").
+										WillReturnRows(sqlmock.NewRows([]string{"user_profile_id"}).AddRow(2).AddRow(3))
+								}
 							}
 						}
 					} else if !tt.invalidJSON {
@@ -363,7 +432,7 @@ func TestJoinGroup(t *testing.T) {
 			}
 
 			c, w := SetupTestContext()
-			SetAuthenticatedUser(c, tt.currentUser, false)
+			SetAuthenticatedUser(c, tt.currentUser, tt.isAdmin)
 			c.Params = []gin.Param{{Key: "group_profile_id", Value: tt.groupID}}
 
 			var jsonData []byte
