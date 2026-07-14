@@ -130,7 +130,7 @@ func TestFetchSubscriber_CreatedStatus_IsSuccess(t *testing.T) {
 		// RevenueCat returns 201 (not 200) the first time it ever sees an
 		// app_user_id -- it auto-vivifies the customer rather than 404ing.
 		w.WriteHeader(http.StatusCreated)
-		w.Write([]byte(`{"subscriber": {"entitlements": {}, "subscriptions": {}}}`))
+		_, _ = w.Write([]byte(`{"subscriber": {"entitlements": {}, "subscriptions": {}}}`))
 	})
 
 	info, err := FetchSubscriber(context.Background(), "42")
@@ -146,7 +146,7 @@ func TestFetchSubscriber_ActiveSubscription(t *testing.T) {
 	withRCSubscribersServer(t, func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{
+		_, _ = w.Write([]byte(`{
 			"subscriber": {
 				"entitlements": {
 					"premium": {
@@ -188,7 +188,7 @@ func TestFetchSubscriber_CancelledSubscription_StillActiveButWontRenew(t *testin
 	setRCSecretAPIKey(t, "sk_test")
 	withRCSubscribersServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{
+		_, _ = w.Write([]byte(`{
 			"subscriber": {
 				"entitlements": {
 					"premium": {
@@ -219,7 +219,7 @@ func TestFetchSubscriber_BillingIssue_StillExpectedToRenew(t *testing.T) {
 	setRCSecretAPIKey(t, "sk_test")
 	withRCSubscribersServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{
+		_, _ = w.Write([]byte(`{
 			"subscriber": {
 				"entitlements": {
 					"premium": {
@@ -250,7 +250,7 @@ func TestFetchSubscriber_ExpiredEntitlement_IsFreeTier(t *testing.T) {
 	setRCSecretAPIKey(t, "sk_test")
 	withRCSubscribersServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{
+		_, _ = w.Write([]byte(`{
 			"subscriber": {
 				"entitlements": {
 					"premium": {
@@ -280,7 +280,7 @@ func TestFetchSubscriber_NoEntitlements_IsFreeTier(t *testing.T) {
 	setRCSecretAPIKey(t, "sk_test")
 	withRCSubscribersServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"subscriber": {"entitlements": {}, "subscriptions": {}}}`))
+		_, _ = w.Write([]byte(`{"subscriber": {"entitlements": {}, "subscriptions": {}}}`))
 	})
 
 	info, err := FetchSubscriber(context.Background(), "42")
@@ -296,7 +296,7 @@ func TestFetchSubscriber_LifetimeNonSubscriptionPurchase(t *testing.T) {
 	setRCSecretAPIKey(t, "sk_test")
 	withRCSubscribersServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{
+		_, _ = w.Write([]byte(`{
 			"subscriber": {
 				"entitlements": {
 					"premium": {
