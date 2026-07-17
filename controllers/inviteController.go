@@ -133,7 +133,7 @@ func JoinGroup(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{
 			"error":   "You have reached the free circle limit. Upgrade to prayerloop Infinite to join more prayer circles.",
 			"code":    "CIRCLE_LIMIT_REACHED",
-			"limit":   FreeCircleLimit,
+			"limit":   FreeCircleLimit(),
 			"current": currentCount,
 		})
 		return

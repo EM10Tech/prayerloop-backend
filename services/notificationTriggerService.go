@@ -67,23 +67,12 @@ func NotifySubjectOfPrayerCreated(
 		return
 	}
 
-	// CRITICAL: Don't notify if subject is not a member of the circle
-	// This prevents privacy leaks where subjects learn about circles they're not in
-	var memberCount int
-	checkQuery := initializers.DB.From("user_group").
-		Select(goqu.COUNT("*")).
-		Where(
-			goqu.And(
-				goqu.C("group_profile_id").Eq(groupID),
-				goqu.C("user_profile_id").Eq(subjectUserID),
-				goqu.C("is_active").IsTrue(),
-			),
-		)
-
-	_, memberCheckErr := checkQuery.Executor().ScanVal(&memberCount)
-	if memberCheckErr != nil || memberCount == 0 {
-		// Subject is not a member of this circle - don't notify them
-		// This maintains privacy: subjects shouldn't know about circles they're not in
+	// CRITICAL: Don't notify if subject is not a member of the circle.
+	// This prevents privacy leaks where subjects learn about circles they're not in.
+	// Fails closed on error, deliberately: a database blip must not be allowed to
+	// read as "is a member".
+	isMember, memberCheckErr := IsActiveCircleMember(groupID, subjectUserID)
+	if memberCheckErr != nil || !isMember {
 		return
 	}
 
@@ -250,6 +239,20 @@ func NotifyCreatorOfPrayerRemovedFromGroup(
 		return
 	}
 
+	// Membership gate. This notification targets groupID for navigation, so a
+	// creator who archived that circle would be pushed into a circle their client
+	// cannot resolve. Gated on circle membership rather than prayer access: the
+	// prayer is being removed from the group here, so prayer_access is precisely
+	// what is going away -- the circle is the thing the deep link depends on.
+	allowed, err := IsActiveCircleMember(groupID, creatorID)
+	if err != nil {
+		log.Printf("Prayer-removed notification gate failed for creator %d, group %d: %v", creatorID, groupID, err)
+		return
+	}
+	if !allowed {
+		return
+	}
+
 	notificationMessage := fmt.Sprintf("%s removed a prayer you made for them from %s", subjectName, groupName)
 
 	// Create notification record with target for navigation
@@ -265,7 +268,7 @@ func NotifyCreatorOfPrayerRemovedFromGroup(
 	}
 
 	insert := initializers.DB.Insert("notification").Rows(notification)
-	_, err := insert.Executor().Exec()
+	_, err = insert.Executor().Exec()
 	if err != nil {
 		log.Printf("Failed to create PRAYER_REMOVED_FROM_GROUP notification for user %d: %v", creatorID, err)
 	}
@@ -301,6 +304,17 @@ func NotifyCreatorOfSubjectEdit(
 	subjectUserID int,
 	subjectName string,
 ) {
+	// Membership gate -- see NotifyUsersOfNewComment. Checked before the debounce
+	// so an ineligible creator does not burn their debounce window.
+	allowed, err := canReceiveNotificationForPrayer(prayerID, creatorID)
+	if err != nil {
+		log.Printf("Subject-edit notification gate failed for creator %d, prayer %d: %v", creatorID, prayerID, err)
+		return
+	}
+	if !allowed {
+		return
+	}
+
 	// Check debounce - 15 minute window
 	if !shouldSendDebounced(models.NotificationTypePrayerEditedBySubject, creatorID, prayerID, 15) {
 		log.Printf("Debounced PRAYER_EDITED_BY_SUBJECT notification for creator %d, prayer %d", creatorID, prayerID)
@@ -325,7 +339,7 @@ func NotifyCreatorOfSubjectEdit(
 	}
 
 	insert := initializers.DB.Insert("notification").Rows(notification)
-	_, err := insert.Executor().Exec()
+	_, err = insert.Executor().Exec()
 	if err != nil {
 		log.Printf("Failed to create PRAYER_EDITED_BY_SUBJECT notification for user %d: %v", creatorID, err)
 	}
@@ -385,6 +399,75 @@ func getSharedGroupForCommentNotification(prayerID int, commenterID int, recipie
 	}
 
 	return &groupID
+}
+
+// IsActiveCircleMember reports whether userID currently holds an active membership
+// in groupID. is_active = FALSE means the member archived the circle: it is gone
+// from their list, so notifications that deep-link into it must not be sent.
+//
+// Returns an error separately from the boolean so callers can decide their own
+// failure posture rather than having a database blip silently read as "not a
+// member".
+func IsActiveCircleMember(groupID int, userID int) (bool, error) {
+	var count int
+	found, err := initializers.DB.From("user_group").
+		Select(goqu.COUNT("*")).
+		Where(
+			goqu.And(
+				goqu.C("group_profile_id").Eq(groupID),
+				goqu.C("user_profile_id").Eq(userID),
+				goqu.C("is_active").IsTrue(),
+			),
+		).Executor().ScanVal(&count)
+	if err != nil {
+		return false, err
+	}
+	if !found {
+		return false, nil
+	}
+	return count > 0, nil
+}
+
+// canReceiveNotificationForPrayer reports whether recipientID still has a live path
+// to prayerID. True when EITHER:
+//
+//   - the recipient holds a direct access_type='user' grant on the prayer (their own
+//     prayer, or one shared to them personally) -- no circle involved; or
+//   - the prayer is shared to at least one circle where the recipient is an ACTIVE
+//     member.
+//
+// Deliberately RECIPIENT-ONLY. Whether the actor has archived the circle is
+// irrelevant to whether the recipient should hear about the event, which is why
+// getSharedGroupForCommentNotification (above) cannot be reused as a gate: it is a
+// two-sided commenter-AND-recipient intersection, it is group-only, and returning
+// nil is a normal non-fatal outcome there (it just drops the deep-link hint).
+//
+// The access_type='user' branch is load-bearing: a user who archived a circle keeps
+// their own prayers in their personal list, and a prayer shared to them directly
+// involves no circle at all. Dropping it would silence notifications on prayers the
+// recipient can plainly still open.
+func canReceiveNotificationForPrayer(prayerID int, recipientID int) (bool, error) {
+	const query = `
+		SELECT EXISTS (
+			SELECT 1 FROM prayer_access pa
+			WHERE pa.prayer_id = $1
+			  AND pa.access_type = 'user'
+			  AND pa.access_type_id = $2
+		) OR EXISTS (
+			SELECT 1 FROM prayer_access pa
+			JOIN user_group ug ON ug.group_profile_id = pa.access_type_id
+			WHERE pa.prayer_id = $1
+			  AND pa.access_type = 'group'
+			  AND ug.user_profile_id = $2
+			  AND ug.is_active = TRUE
+		)
+	`
+
+	var allowed bool
+	if err := initializers.DB.QueryRow(query, prayerID, recipientID).Scan(&allowed); err != nil {
+		return false, err
+	}
+	return allowed, nil
 }
 
 // NotifyUsersOfNewComment notifies prayer creator, subject, and previous commenters of new comment.
@@ -458,8 +541,30 @@ func NotifyUsersOfNewComment(prayerID int, commentID int, commenterID int) {
 		}
 	}
 
-	// 5. For each recipient, check debounce and create notification
+	// 5. For each recipient, check membership, debounce, and create notification
 	for _, recipientID := range recipientIDs {
+		// Membership gate. Recipients are built from prayer.created_by /
+		// prayer_subject / prior commenters above -- none of which carry any
+		// concept of current membership, so a member who archived the circle
+		// would otherwise keep receiving comment pushes that deep-link into a
+		// circle no longer in their list.
+		//
+		// Checked BEFORE the debounce so an ineligible recipient does not
+		// consume their debounce window; otherwise restoring the circle inside
+		// the 15-minute window would be met with silence.
+		allowed, err := canReceiveNotificationForPrayer(prayerID, recipientID)
+		if err != nil {
+			// Fail closed: this query is simple and indexed, so an error here
+			// almost certainly means the database is unhealthy -- in which case
+			// the notification INSERT below would fail anyway. Sending on error
+			// would reintroduce exactly the bug this gate exists to fix.
+			log.Printf("Comment notification gate failed for user %d, prayer %d: %v", recipientID, prayerID, err)
+			continue
+		}
+		if !allowed {
+			continue
+		}
+
 		// Check 15-minute debounce window
 		if !shouldSendDebounced(models.NotificationTypePrayerCommentAdded, recipientID, prayerID, 15) {
 			log.Printf("Debounced comment notification for user %d, prayer %d", recipientID, prayerID)

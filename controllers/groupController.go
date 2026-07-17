@@ -29,7 +29,7 @@ func CreateGroup(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{
 			"error":   "You have reached the free prayer circle limit. Upgrade to prayerloop Infinite to create more prayer circles.",
 			"code":    "CIRCLE_LIMIT_REACHED",
-			"limit":   FreeCircleLimit,
+			"limit":   FreeCircleLimit(),
 			"current": currentCount,
 		})
 		return
@@ -415,12 +415,46 @@ func DeleteGroup(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Group deleted successfully"})
 }
 
+// groupMemberResponse is a circle roster entry: everything GetGroupUsers has
+// always returned, plus the membership's is_active.
+//
+// models.UserProfile is EMBEDDED rather than reimplemented so the shipped JSON
+// shape stays byte-identical. The handler only ever selected 7 columns, so the
+// rest have always serialized as zero values -- that is pre-existing and not
+// something to "fix" here, but dropping those keys outright would be a real
+// contract change riding along on an unrelated feature.
+//
+// Is_Active lives on the wrapper, not on UserProfile, because it belongs to the
+// user_group membership row rather than to the user. Conflating the two is the
+// same error as reusing the client's Group.isActive -- which means
+// group_profile.is_active, "the circle is deactivated" -- for archived state.
+type groupMemberResponse struct {
+	models.UserProfile
+	// IsActive false means this member archived the circle. Render them greyed
+	// and labelled "Inactive" -- never remove them from the roster, which would
+	// read as having left, and never show them as normally present, which would
+	// have people believing they are being prayed for when they are not.
+	Is_Active bool `db:"is_active" json:"isActive"`
+}
+
 func GetGroupUsers(c *gin.Context) {
 	groupID, err := strconv.Atoi(c.Param("group_profile_id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid group profile ID", "details": err.Error()})
 		return
 	}
+
+	// includeInactive opts in to archived members being returned, rendered
+	// greyed as "Inactive" by clients that understand the flag.
+	//
+	// Opt-in rather than unconditional, deliberately. Removing the is_active
+	// filter outright would change a shipped contract: a client that predates
+	// the isActive field would render archived members as fully present, which
+	// is the worst available error here -- in a prayer app, someone posting
+	// "please pray for my surgery" believing a member sees it when they do not
+	// is more harmful than the member appearing to have left. So old clients
+	// keep the old behavior until they ask for the new one.
+	includeInactive, _ := strconv.ParseBool(c.DefaultQuery("includeInactive", "false"))
 
 	query := initializers.DB.From("user_group").
 		Select(
@@ -431,17 +465,17 @@ func GetGroupUsers(c *gin.Context) {
 			"user_profile.last_name",
 			"user_group.created_by",
 			"user_group.updated_by",
+			goqu.I("user_group.is_active").As("is_active"),
 		).
 		InnerJoin(
 			goqu.T("user_profile"),
 			goqu.On(goqu.Ex{"user_group.user_profile_id": goqu.I("user_profile.user_profile_id")}),
 		).
-		Where(
-			goqu.And(
-				goqu.C("group_profile_id").Table("user_group").Eq(groupID),
-				goqu.C("is_active").Table("user_group").IsTrue(),
-			),
-		)
+		Where(goqu.C("group_profile_id").Table("user_group").Eq(groupID))
+
+	if !includeInactive {
+		query = query.Where(goqu.C("is_active").Table("user_group").IsTrue())
+	}
 
 	sql, args, err := query.ToSQL()
 	if err != nil {
@@ -449,7 +483,7 @@ func GetGroupUsers(c *gin.Context) {
 		return
 	}
 
-	var users []models.UserProfile
+	var users []groupMemberResponse
 	err = initializers.DB.ScanStructs(&users, sql, args...)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch group users", "details": err.Error()})
@@ -458,7 +492,7 @@ func GetGroupUsers(c *gin.Context) {
 
 	// Always return an array, even if empty (for consistent client-side handling)
 	if users == nil {
-		users = []models.UserProfile{}
+		users = []groupMemberResponse{}
 	}
 
 	c.JSON(http.StatusOK, users)
@@ -619,8 +653,37 @@ func RemoveUserFromGroup(c *gin.Context) {
 		return
 	}
 
+	// If the departing user was the circle's creator, hand ownership to the
+	// longest-tenured remaining active member.
+	//
+	// Fixes a pre-existing orphan bug unrelated to billing: group_profile
+	// .created_by has no foreign key and was never reassigned by any code path,
+	// while this handler has always permitted self-removal with no creator
+	// guard. So a creator leaving left created_by pointing at a non-member --
+	// and since UpdateGroup/DeleteGroup are creator-gated, nobody but a global
+	// admin could ever manage that circle again.
+	//
+	// Best-effort: the removal itself already committed, and stranding the user
+	// in the circle they just left would be worse than a circle that still needs
+	// an owner. Logged loudly so it is visible if it ever fails.
+	if group.Created_By == userID {
+		newOwnerID, ownerErr := reassignOwnershipOnDeparture(groupID, userID)
+		switch {
+		case ownerErr != nil:
+			log.Printf("ORPHANED: failed to reassign owner of group %d after creator %d left: %v", groupID, userID, ownerErr)
+		case newOwnerID == 0:
+			// Nobody left to own it. Harmless: with no members the circle is
+			// invisible to everyone, and it stays reapable later.
+			log.Printf("Group %d has no remaining active members after creator %d left; ownership not reassigned", groupID, userID)
+		}
+	}
+
 	// Tear down the leaving user's circle contact graph (their own group-type
 	// subject, plus join rows for individual contacts on either side of them).
+	//
+	// Archive deliberately does NOT do this: archiving is not leaving, the
+	// user_group row survives, and the contacts are the user's own prayer
+	// subjects which should still be there when they restore.
 	logCircleContactErr("RemoveCircleContactsForLeavingUser",
 		RemoveCircleContactsForLeavingUser(userID, groupID))
 

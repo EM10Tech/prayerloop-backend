@@ -391,7 +391,7 @@ func TestJoinGroup(t *testing.T) {
 									}
 									mock.ExpectQuery("SELECT \"is_premium\" FROM \"user_subscription\"").
 										WillReturnRows(premiumRows)
-									atCircleLimit = tt.circleCount >= FreeCircleLimit && !tt.isPremium
+									atCircleLimit = tt.circleCount >= FreeCircleLimit() && !tt.isPremium
 								}
 
 								if !atCircleLimit {

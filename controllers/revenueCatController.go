@@ -220,8 +220,31 @@ const rcEventTypeSync = "SYNC"
 // user_subscription row only -- it never calls out to RevenueCat itself (see
 // SyncSubscription below for the one endpoint that does). A missing row
 // means free tier: user_subscription doesn't require a row per user.
+// mySubscriptionResponse embeds the stored row so the shipped field shape is
+// preserved byte-for-byte, and adds the three facts the client's over-limit
+// entry gate needs.
+//
+// These live here rather than as client constants because the gate must be
+// remotely disarmable: a client that hardcodes the limit cannot be corrected
+// without a release, and it is the one behavior in this feature that can lock a
+// paying user out of circles they already have.
+type mySubscriptionResponse struct {
+	models.UserSubscription
+	// EffectiveCircleLimit is the active-circle cap that applies to this caller.
+	// Mirrors FREE_CIRCLE_LIMIT, so raising it server-side also raises the
+	// client's gate threshold.
+	EffectiveCircleLimit int `json:"effectiveCircleLimit"`
+	// Unlimited is true for premium users and admins -- neither has a cap, so
+	// the client must never gate them regardless of their circle count.
+	Unlimited bool `json:"unlimited"`
+	// GateEnabled is the kill switch. False means do not arm the entry gate at
+	// all, whatever the counts say.
+	GateEnabled bool `json:"gateEnabled"`
+}
+
 func GetMySubscription(c *gin.Context) {
 	currentUser := c.MustGet("currentUser").(models.UserProfile)
+	isAdmin := c.MustGet("admin").(bool)
 
 	var sub models.UserSubscription
 	found, err := initializers.DB.From("user_subscription").
@@ -232,12 +255,28 @@ func GetMySubscription(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch subscription"})
 		return
 	}
+
 	if !found {
-		c.JSON(http.StatusOK, gin.H{"isPremium": false})
+		// Absent row means free tier. Kept minimal rather than emitting a
+		// zero-valued struct: that would report userProfileId 0 and a
+		// year-0001 datetime_create as though they were real, which is worse
+		// than saying nothing. The gate fields still ship, because a free user
+		// with no subscription row is exactly who the gate applies to.
+		c.JSON(http.StatusOK, gin.H{
+			"isPremium":            false,
+			"effectiveCircleLimit": FreeCircleLimit(),
+			"unlimited":            isAdmin,
+			"gateEnabled":          CircleEntryGateEnabled(),
+		})
 		return
 	}
 
-	c.JSON(http.StatusOK, sub)
+	c.JSON(http.StatusOK, mySubscriptionResponse{
+		UserSubscription:     sub,
+		EffectiveCircleLimit: FreeCircleLimit(),
+		Unlimited:            sub.Is_Premium || isAdmin,
+		GateEnabled:          CircleEntryGateEnabled(),
+	})
 }
 
 // SyncSubscription handles POST /users/me/subscription/sync. RevenueCat's

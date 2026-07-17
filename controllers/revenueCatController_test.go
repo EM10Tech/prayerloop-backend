@@ -284,7 +284,16 @@ func TestGetMySubscription_NoRow_DefaultsToFreeTier(t *testing.T) {
 	GetMySubscription(c)
 
 	assert.Equal(t, http.StatusOK, w.Code)
-	assert.JSONEq(t, `{"isPremium": false}`, w.Body.String())
+	// Still minimal -- deliberately NOT a zero-valued user_subscription struct,
+	// which would report userProfileId 0 and a year-0001 timestamp as if real.
+	// The gate fields ship even with no row, because a user with no
+	// subscription row is precisely who the over-limit gate applies to.
+	assert.JSONEq(t, `{
+		"isPremium": false,
+		"effectiveCircleLimit": 3,
+		"unlimited": false,
+		"gateEnabled": true
+	}`, w.Body.String())
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
