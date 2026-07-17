@@ -137,8 +137,12 @@ func RevenueCatWebhook(c *gin.Context) {
 				"will_renew":             willRenew,
 				"last_event_type":        event.Event_Type,
 				"last_event_at":          msToTime(&event.Event_Timestamp_Ms),
-			}))
+			}).Where(grandfatherGuard()))
 
+		// A guard-suppressed update affects zero rows; that's the intended
+		// outcome (the grandfather row stands), not an error. Defense-in-depth
+		// here: RevenueCat sends no events for users it has never seen, but the
+		// unguarded shape would be the same bug as /sync's (#49).
 		_, err = upsert.Executor().Exec()
 		return err
 	})
@@ -215,6 +219,29 @@ func msToTime(ms *int64) *time.Time {
 // a non-webhook sentinel precedent: the LEGACY_GRANDFATHER backfill from
 // migration 029.
 const rcEventTypeSync = "SYNC"
+
+// rcEventTypeLegacyGrandfather is the sentinel migration 029's backfill wrote
+// for every pre-launch account: permanent free premium, no expiry. RevenueCat
+// has never heard of these users -- it auto-vivifies unknown subscribers and
+// answers "not premium, no error" -- so its answer for a grandfathered user
+// is ignorance, not a demotion (#49).
+const rcEventTypeLegacyGrandfather = "LEGACY_GRANDFATHER"
+
+// grandfatherGuard is the ON CONFLICT DO UPDATE guard shared by both
+// user_subscription upserts (webhook and /sync): a write that would set
+// is_premium = FALSE must not touch a row still carrying the
+// LEGACY_GRANDFATHER sentinel, which also keeps the sentinel itself from
+// being overwritten -- once it's gone the demotion is unauditable and the
+// 029 backfill (ON CONFLICT DO NOTHING) cannot repair it. A premium write
+// (e.g. the user actually purchases) passes through and retires the
+// sentinel; normal lifecycle applies from then on. IS DISTINCT FROM rather
+// than != so a NULL last_event_type never suppresses a legitimate update.
+func grandfatherGuard() goqu.Expression {
+	return goqu.L(
+		"(user_subscription.last_event_type IS DISTINCT FROM ? OR excluded.is_premium)",
+		rcEventTypeLegacyGrandfather,
+	)
+}
 
 // GetMySubscription handles GET /users/me/subscription. Reads the cached
 // user_subscription row only -- it never calls out to RevenueCat itself (see
@@ -328,7 +355,7 @@ func SyncSubscription(c *gin.Context) {
 			"will_renew":             info.WillRenew,
 			"last_event_type":        rcEventTypeSync,
 			"last_event_at":          now,
-		})).
+		}).Where(grandfatherGuard())).
 		Returning(
 			"user_subscription_id", "user_profile_id", "is_premium", "entitlement_id",
 			"product_id", "store", "period_type", "expires_at", "will_renew",
@@ -342,9 +369,25 @@ func SyncSubscription(c *gin.Context) {
 		return
 	}
 	if !found {
-		log.Printf("Upsert for user %d returned no row", currentUser.User_Profile_ID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save subscription"})
-		return
+		// No row back from an upsert with RETURNING means the DO UPDATE's
+		// grandfatherGuard declined the write: a non-premium RevenueCat answer
+		// landed on a LEGACY_GRANDFATHER row. That's a success -- the grant
+		// stands -- so return the protected row instead. The reload can race a
+		// concurrent webhook write, but whatever it reads is the current
+		// authoritative state, which is exactly what /sync promises.
+		reloadFound, reloadErr := initializers.DB.From("user_subscription").
+			Where(goqu.C("user_profile_id").Eq(currentUser.User_Profile_ID)).
+			ScanStruct(&sub)
+		if reloadErr != nil {
+			log.Printf("Failed to reload guarded subscription for user %d: %v", currentUser.User_Profile_ID, reloadErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save subscription"})
+			return
+		}
+		if !reloadFound {
+			log.Printf("Upsert for user %d returned no row and no existing row found", currentUser.User_Profile_ID)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save subscription"})
+			return
+		}
 	}
 
 	c.JSON(http.StatusOK, sub)
