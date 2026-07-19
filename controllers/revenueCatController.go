@@ -137,8 +137,12 @@ func RevenueCatWebhook(c *gin.Context) {
 				"will_renew":             willRenew,
 				"last_event_type":        event.Event_Type,
 				"last_event_at":          msToTime(&event.Event_Timestamp_Ms),
-			}))
+			}).Where(grandfatherGuard()))
 
+		// A guard-suppressed update affects zero rows; that's the intended
+		// outcome (the grandfather row stands), not an error. Defense-in-depth
+		// here: RevenueCat sends no events for users it has never seen, but the
+		// unguarded shape would be the same bug as /sync's (#49).
 		_, err = upsert.Executor().Exec()
 		return err
 	})
@@ -216,12 +220,58 @@ func msToTime(ms *int64) *time.Time {
 // migration 029.
 const rcEventTypeSync = "SYNC"
 
+// rcEventTypeLegacyGrandfather is the sentinel migration 029's backfill wrote
+// for every pre-launch account: permanent free premium, no expiry. RevenueCat
+// has never heard of these users -- it auto-vivifies unknown subscribers and
+// answers "not premium, no error" -- so its answer for a grandfathered user
+// is ignorance, not a demotion (#49).
+const rcEventTypeLegacyGrandfather = "LEGACY_GRANDFATHER"
+
+// grandfatherGuard is the ON CONFLICT DO UPDATE guard shared by both
+// user_subscription upserts (webhook and /sync): a write that would set
+// is_premium = FALSE must not touch a row still carrying the
+// LEGACY_GRANDFATHER sentinel, which also keeps the sentinel itself from
+// being overwritten -- once it's gone the demotion is unauditable and the
+// 029 backfill (ON CONFLICT DO NOTHING) cannot repair it. A premium write
+// (e.g. the user actually purchases) passes through and retires the
+// sentinel; normal lifecycle applies from then on. IS DISTINCT FROM rather
+// than != so a NULL last_event_type never suppresses a legitimate update.
+func grandfatherGuard() goqu.Expression {
+	return goqu.L(
+		"(user_subscription.last_event_type IS DISTINCT FROM ? OR excluded.is_premium)",
+		rcEventTypeLegacyGrandfather,
+	)
+}
+
 // GetMySubscription handles GET /users/me/subscription. Reads the cached
 // user_subscription row only -- it never calls out to RevenueCat itself (see
 // SyncSubscription below for the one endpoint that does). A missing row
 // means free tier: user_subscription doesn't require a row per user.
+// mySubscriptionResponse embeds the stored row so the shipped field shape is
+// preserved byte-for-byte, and adds the three facts the client's over-limit
+// entry gate needs.
+//
+// These live here rather than as client constants because the gate must be
+// remotely disarmable: a client that hardcodes the limit cannot be corrected
+// without a release, and it is the one behavior in this feature that can lock a
+// paying user out of circles they already have.
+type mySubscriptionResponse struct {
+	models.UserSubscription
+	// EffectiveCircleLimit is the active-circle cap that applies to this caller.
+	// Mirrors FREE_CIRCLE_LIMIT, so raising it server-side also raises the
+	// client's gate threshold.
+	EffectiveCircleLimit int `json:"effectiveCircleLimit"`
+	// Unlimited is true for premium users and admins -- neither has a cap, so
+	// the client must never gate them regardless of their circle count.
+	Unlimited bool `json:"unlimited"`
+	// GateEnabled is the kill switch. False means do not arm the entry gate at
+	// all, whatever the counts say.
+	GateEnabled bool `json:"gateEnabled"`
+}
+
 func GetMySubscription(c *gin.Context) {
 	currentUser := c.MustGet("currentUser").(models.UserProfile)
+	isAdmin := c.MustGet("admin").(bool)
 
 	var sub models.UserSubscription
 	found, err := initializers.DB.From("user_subscription").
@@ -232,12 +282,28 @@ func GetMySubscription(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch subscription"})
 		return
 	}
+
 	if !found {
-		c.JSON(http.StatusOK, gin.H{"isPremium": false})
+		// Absent row means free tier. Kept minimal rather than emitting a
+		// zero-valued struct: that would report userProfileId 0 and a
+		// year-0001 datetime_create as though they were real, which is worse
+		// than saying nothing. The gate fields still ship, because a free user
+		// with no subscription row is exactly who the gate applies to.
+		c.JSON(http.StatusOK, gin.H{
+			"isPremium":            false,
+			"effectiveCircleLimit": FreeCircleLimit(),
+			"unlimited":            isAdmin,
+			"gateEnabled":          CircleEntryGateEnabled(),
+		})
 		return
 	}
 
-	c.JSON(http.StatusOK, sub)
+	c.JSON(http.StatusOK, mySubscriptionResponse{
+		UserSubscription:     sub,
+		EffectiveCircleLimit: FreeCircleLimit(),
+		Unlimited:            sub.Is_Premium || isAdmin,
+		GateEnabled:          CircleEntryGateEnabled(),
+	})
 }
 
 // SyncSubscription handles POST /users/me/subscription/sync. RevenueCat's
@@ -289,7 +355,7 @@ func SyncSubscription(c *gin.Context) {
 			"will_renew":             info.WillRenew,
 			"last_event_type":        rcEventTypeSync,
 			"last_event_at":          now,
-		})).
+		}).Where(grandfatherGuard())).
 		Returning(
 			"user_subscription_id", "user_profile_id", "is_premium", "entitlement_id",
 			"product_id", "store", "period_type", "expires_at", "will_renew",
@@ -303,9 +369,25 @@ func SyncSubscription(c *gin.Context) {
 		return
 	}
 	if !found {
-		log.Printf("Upsert for user %d returned no row", currentUser.User_Profile_ID)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save subscription"})
-		return
+		// No row back from an upsert with RETURNING means the DO UPDATE's
+		// grandfatherGuard declined the write: a non-premium RevenueCat answer
+		// landed on a LEGACY_GRANDFATHER row. That's a success -- the grant
+		// stands -- so return the protected row instead. The reload can race a
+		// concurrent webhook write, but whatever it reads is the current
+		// authoritative state, which is exactly what /sync promises.
+		reloadFound, reloadErr := initializers.DB.From("user_subscription").
+			Where(goqu.C("user_profile_id").Eq(currentUser.User_Profile_ID)).
+			ScanStruct(&sub)
+		if reloadErr != nil {
+			log.Printf("Failed to reload guarded subscription for user %d: %v", currentUser.User_Profile_ID, reloadErr)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save subscription"})
+			return
+		}
+		if !reloadFound {
+			log.Printf("Upsert for user %d returned no row and no existing row found", currentUser.User_Profile_ID)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save subscription"})
+			return
+		}
 	}
 
 	c.JSON(http.StatusOK, sub)

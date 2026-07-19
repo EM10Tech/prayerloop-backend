@@ -86,6 +86,16 @@ func main() {
 		auth.GET("/users/me/subscription", controllers.GetMySubscription)
 		auth.POST("/users/me/subscription/sync", controllers.SyncSubscription)
 
+		// Circle archiving. These three are atomic as a set: GetUserGroups
+		// filters is_active server-side, so the instant ArchiveCircles writes
+		// is_active=false the circle vanishes from the user's list, and
+		// GetArchivedCircles is the ONLY thing that makes it visible again.
+		// Deploying archive without archived/restore turns archiving into
+		// deletion.
+		auth.POST("/users/me/circles/archive", controllers.ArchiveCircles)
+		auth.POST("/users/me/circles/restore", controllers.RestoreCircles)
+		auth.GET("/users/me/circles/archived", controllers.GetArchivedCircles)
+
 		auth.GET("/users/:user_profile_id/groups", controllers.GetUserGroups)
 		auth.PATCH("/users/:user_profile_id/groups/reorder", controllers.ReorderUserGroups)
 
@@ -120,6 +130,7 @@ func main() {
 		auth.GET("/groups/:group_profile_id", controllers.GetGroup)
 		auth.PUT("/groups/:group_profile_id", controllers.UpdateGroup)
 		auth.DELETE("/groups/:group_profile_id", controllers.DeleteGroup)
+		auth.PUT("/groups/:group_profile_id/owner", controllers.TransferGroupOwnership)
 
 		auth.GET("/groups/:group_profile_id/prayers", controllers.GetGroupPrayers)
 		auth.POST("/groups/:group_profile_id/prayers", controllers.CreateGroupPrayer)

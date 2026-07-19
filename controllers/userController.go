@@ -1638,6 +1638,45 @@ func DeleteUserAccount(c *gin.Context) {
 		return
 	}
 
+	// 9a. Hand off circles this user CREATED, before their memberships go.
+	//
+	// Fixes the worse half of a pre-existing orphan bug unrelated to billing:
+	// group_profile.created_by has no foreign key and was never reassigned by
+	// any code path, so deleting an account left created_by pointing at a
+	// hard-deleted user_profile with nothing to stop it. Since
+	// UpdateGroup/DeleteGroup are creator-gated, every remaining member was
+	// permanently locked out of managing a circle they are still in, and unlike
+	// the creator-leaves case there is no way back -- the creator cannot return.
+	//
+	// Runs BEFORE step 9's delete purely for readability; the successor lookup
+	// excludes this user either way.
+	//
+	// Best-effort per circle: a failure here must not abort an account deletion
+	// the user has asked for and which has already destroyed other rows above.
+	// Logged loudly enough to find later.
+	var createdGroupIDs []int
+	err = initializers.DB.From("group_profile").
+		Select("group_profile_id").
+		Where(goqu.Ex{"created_by": userID, "is_active": true}).
+		ScanVals(&createdGroupIDs)
+	if err != nil {
+		log.Printf("Failed to list circles created by user %d during account deletion: %v", userID, err)
+	}
+	for _, groupID := range createdGroupIDs {
+		newOwnerID, ownerErr := reassignOwnershipOnDeparture(groupID, userID)
+		switch {
+		case ownerErr != nil:
+			log.Printf("ORPHANED: failed to reassign owner of group %d while deleting creator %d: %v", groupID, userID, ownerErr)
+		case newOwnerID == 0:
+			// Nobody left to own it. Deliberately NOT deleted here: with no
+			// members it is invisible to everyone and harms nothing, whereas
+			// destroying circles as a side effect of an account deletion is a
+			// much larger decision than this fix should be making. Reaping
+			// empty circles is separable cleanup.
+			log.Printf("Group %d has no members left after creator %d deleted their account; left ownerless", groupID, userID)
+		}
+	}
+
 	// 9. Remove user from all groups
 	_, err = initializers.DB.Delete("user_group").
 		Where(goqu.C("user_profile_id").Eq(userID)).
