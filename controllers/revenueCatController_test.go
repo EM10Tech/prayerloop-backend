@@ -235,6 +235,35 @@ func TestRevenueCatWebhook_SubscriptionUpsertFails_RollsBackAndReturns500(t *tes
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
+// Defense-in-depth mirror of the /sync guard (#49): the webhook upsert's DO
+// UPDATE must carry the same grandfather guard. RevenueCat sends no events
+// for users it has never seen, so this path can't currently hit a
+// LEGACY_GRANDFATHER row -- but the unguarded shape would be the identical
+// bug, and a guard-suppressed update (zero rows affected) must still 200.
+func TestRevenueCatWebhook_UpsertCarriesGrandfatherGuard(t *testing.T) {
+	enableRCWebhookSecret(t)
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	c, w := SetupTestContext()
+	body := buildRCWebhookBody(rcTestEventOpts{
+		ID: "evt_exp_gf", Type: "EXPIRATION", AppUserID: "42",
+	})
+	c.Request = rcWebhookRequest(body, signRCWebhookBody(body, "1000"))
+
+	mock.ExpectBegin()
+	mock.ExpectQuery(`INSERT INTO "revenuecat_webhook_event"`).
+		WillReturnRows(sqlmock.NewRows([]string{"revenuecat_webhook_event_id"}).AddRow(1))
+	mock.ExpectExec(`INSERT INTO "user_subscription".*DO UPDATE SET .* WHERE .*user_subscription\.last_event_type IS DISTINCT FROM 'LEGACY_GRANDFATHER' OR excluded\.is_premium`).
+		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectCommit()
+
+	RevenueCatWebhook(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
 var userSubscriptionColumns = []string{
 	"user_subscription_id", "user_profile_id", "is_premium", "entitlement_id",
 	"product_id", "store", "period_type", "expires_at", "will_renew",
@@ -284,7 +313,16 @@ func TestGetMySubscription_NoRow_DefaultsToFreeTier(t *testing.T) {
 	GetMySubscription(c)
 
 	assert.Equal(t, http.StatusOK, w.Code)
-	assert.JSONEq(t, `{"isPremium": false}`, w.Body.String())
+	// Still minimal -- deliberately NOT a zero-valued user_subscription struct,
+	// which would report userProfileId 0 and a year-0001 timestamp as if real.
+	// The gate fields ship even with no row, because a user with no
+	// subscription row is precisely who the over-limit gate applies to.
+	assert.JSONEq(t, `{
+		"isPremium": false,
+		"effectiveCircleLimit": 3,
+		"unlimited": false,
+		"gateEnabled": true
+	}`, w.Body.String())
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
@@ -367,13 +405,49 @@ func TestSyncSubscription_Success(t *testing.T) {
 	assert.NoError(t, mock.ExpectationsWereMet())
 }
 
-func TestSyncSubscription_UpsertReturnsNoRow(t *testing.T) {
+// The #49 regression test: RevenueCat auto-vivifies users it has never seen
+// and answers "not premium", so /sync for a grandfathered user must NOT
+// demote the LEGACY_GRANDFATHER row -- the guard suppresses the DO UPDATE
+// (no row back despite RETURNING) and the endpoint answers with the
+// preserved row instead of an error.
+func TestSyncSubscription_NonPremiumAnswer_PreservesGrandfather(t *testing.T) {
+	withRCSubscriberServer(t, http.StatusOK, `{"subscriber": {"entitlements": {}, "subscriptions": {}}}`)
+
+	_, mock, cleanup := SetupTestDB(t)
+	defer cleanup()
+
+	// The regex pins the guard into the generated SQL -- if the WHERE ever
+	// falls off the DO UPDATE, this expectation stops matching.
+	mock.ExpectQuery(`INSERT INTO "user_subscription".*DO UPDATE SET .* WHERE .*user_subscription\.last_event_type IS DISTINCT FROM 'LEGACY_GRANDFATHER' OR excluded\.is_premium`).
+		WillReturnRows(sqlmock.NewRows(userSubscriptionColumns))
+
+	now := time.Now()
+	rows := sqlmock.NewRows(userSubscriptionColumns).
+		AddRow(1, 1, true, "premium", nil, nil, nil, nil, false, "1", "LEGACY_GRANDFATHER", now, now, now)
+	mock.ExpectQuery(`SELECT .* FROM "user_subscription"`).WillReturnRows(rows)
+
+	c, w := SetupTestContext()
+	SetAuthenticatedUser(c, MockUser(), false)
+	c.Request = httptest.NewRequest(http.MethodPost, "/users/me/subscription/sync", nil)
+
+	SyncSubscription(c)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var response map[string]interface{}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Equal(t, true, response["isPremium"])
+	assert.Equal(t, "LEGACY_GRANDFATHER", response["lastEventType"])
+	assert.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestSyncSubscription_NoRowAndNoExistingRow_Returns500(t *testing.T) {
 	withRCSubscriberServer(t, http.StatusOK, `{"subscriber": {"entitlements": {}, "subscriptions": {}}}`)
 
 	_, mock, cleanup := SetupTestDB(t)
 	defer cleanup()
 
 	mock.ExpectQuery(`INSERT INTO "user_subscription"`).WillReturnRows(sqlmock.NewRows(userSubscriptionColumns))
+	mock.ExpectQuery(`SELECT .* FROM "user_subscription"`).WillReturnRows(sqlmock.NewRows(userSubscriptionColumns))
 
 	c, w := SetupTestContext()
 	SetAuthenticatedUser(c, MockUser(), false)

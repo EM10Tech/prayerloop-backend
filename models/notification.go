@@ -31,6 +31,32 @@ const (
 	// NotificationTypePrayerRemovedFromGroup fires when a linked subject removes a prayer from a group.
 	// Recipient: The prayer creator.
 	NotificationTypePrayerRemovedFromGroup = "PRAYER_REMOVED_FROM_GROUP"
+
+	// NotificationTypeCircleMemberArchived fires when a member archives a circle.
+	// Recipient: The circle creator ONLY -- one person, not the whole circle.
+	//
+	// Copy must never reuse the "has left the group" wording: they have not
+	// left, their user_group row survives, and restoring is one tap. It must
+	// also not leak the billing mechanic that may have prompted it.
+	NotificationTypeCircleMemberArchived = "CIRCLE_MEMBER_ARCHIVED"
+
+	// NotificationTypeCircleCreatorArchived fires when a circle's creator
+	// archives their own circle while other active members remain.
+	// Recipients: All other active members.
+	//
+	// Broader than CIRCLE_MEMBER_ARCHIVED because there is nobody above the
+	// creator to tell, and the owner going quiet is materially different from
+	// a member doing so. Skipped entirely when the creator is the sole member.
+	NotificationTypeCircleCreatorArchived = "CIRCLE_CREATOR_ARCHIVED"
+
+	// NotificationTypeCircleOwnershipTransferred fires when a circle's
+	// ownership is reassigned.
+	// Recipient: The new owner.
+	//
+	// Transfer is unilateral with no acceptance step, so this notification is
+	// the only thing that tells the new owner they now have rights and
+	// responsibilities they did not ask for. It is not optional.
+	NotificationTypeCircleOwnershipTransferred = "CIRCLE_OWNERSHIP_TRANSFERRED"
 )
 
 // Notification status constants
