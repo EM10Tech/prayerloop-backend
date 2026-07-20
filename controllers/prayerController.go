@@ -282,42 +282,18 @@ func AddPrayerAccess(c *gin.Context) {
 		}
 
 		// check to see if logged in user has permission to give access to this prayer
-		var prayerAccess models.PrayerAccess
-		accessFound, err := initializers.DB.From("prayer_access").
-			Select(
-				goqu.I("prayer_access.prayer_access_id"),
-				goqu.I("prayer_access.prayer_id"),
-				goqu.I("prayer_access.access_type"),
-				goqu.I("prayer_access.access_type_id"),
-				goqu.I("prayer_access.datetime_create"),
-				goqu.I("prayer_access.datetime_update"),
-				goqu.I("prayer_access.created_by"),
-				goqu.I("prayer_access.updated_by"),
-			).
-			Join(
-				goqu.T("user_group"),
-				goqu.On(
-					goqu.Or(
-						goqu.Ex{"prayer_access.access_type": "group", "prayer_access.access_type_id": goqu.I("user_group.group_profile_id")},
-						goqu.Ex{"prayer_access.access_type": "user", "prayer_access.access_type_id": goqu.I("user_group.user_profile_id")},
-					),
-				),
-			).
-			Where(goqu.C("prayer_id").Eq(prayerId), goqu.C("user_profile_id").Eq(userID)).
-			Order(goqu.I("user_profile_id").Asc(), goqu.I("prayer_access.access_type").Asc()).
-			ScanStruct(&prayerAccess)
+		// (runs before the admin gate so the query order stays consistent)
+		hasAccess, err := userHasPrayerAccess(userID, prayerId)
 
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch prayer access record", "details": err.Error()})
 			return
 		}
 
-		// For 'subject' access type, user just needs to be able to view the prayer (accessFound)
-		// For 'user' and 'group' access types, user must be the prayer creator
 		if !admin {
 			// User needs view access to the prayer to share it
-			if !accessFound {
-				c.JSON(http.StatusUnauthorized, gin.H{"error": "You don't have access to this prayer"})
+			if !hasAccess {
+				c.JSON(http.StatusForbidden, gin.H{"error": "You don't have access to this prayer"})
 				return
 			}
 
@@ -338,13 +314,13 @@ func AddPrayerAccess(c *gin.Context) {
 				}
 
 				if !found || count == 0 {
-					c.JSON(http.StatusUnauthorized, gin.H{"error": "You must be a member of the prayer circle to share this prayer with it"})
+					c.JSON(http.StatusForbidden, gin.H{"error": "You must be a member of the prayer circle to share this prayer with it"})
 					return
 				}
 			}
 		}
 
-		if accessFound || admin {
+		if hasAccess || admin {
 
 			prayerAccessInsert := models.PrayerAccess{
 				Prayer_ID:      prayerId,
@@ -1110,33 +1086,13 @@ func GetPrayerHistory(c *gin.Context) {
 
 	// Allow anyone with prayer access to view history (same as viewing the prayer itself)
 	if !admin {
-		// Check if user has access to this prayer via prayer_access table
-		var count int64
-		found, err := initializers.DB.From("prayer_access").
-			Select(goqu.COUNT("*")).
-			Join(
-				goqu.T("user_group"),
-				goqu.On(
-					goqu.Or(
-						goqu.Ex{"prayer_access.access_type": "group", "prayer_access.access_type_id": goqu.I("user_group.group_profile_id")},
-						goqu.Ex{"prayer_access.access_type": "user", "prayer_access.access_type_id": goqu.I("user_group.user_profile_id")},
-					),
-				),
-			).
-			Where(
-				goqu.And(
-					goqu.I("prayer_access.prayer_id").Eq(prayerID),
-					goqu.I("user_group.user_profile_id").Eq(userID),
-				),
-			).
-			ScanVal(&count)
-
+		hasAccess, err := userHasPrayerAccess(userID, prayerID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check prayer access", "details": err.Error()})
 			return
 		}
 
-		if !found || count == 0 {
+		if !hasAccess {
 			c.JSON(http.StatusForbidden, gin.H{"error": "You don't have access to this prayer"})
 			return
 		}
@@ -1182,32 +1138,13 @@ func GetPrayerAccessRecords(c *gin.Context) {
 
 	// Check if user has access to this prayer
 	if !admin {
-		var count int64
-		found, err := initializers.DB.From("prayer_access").
-			Select(goqu.COUNT("*")).
-			Join(
-				goqu.T("user_group"),
-				goqu.On(
-					goqu.Or(
-						goqu.Ex{"prayer_access.access_type": "group", "prayer_access.access_type_id": goqu.I("user_group.group_profile_id")},
-						goqu.Ex{"prayer_access.access_type": "user", "prayer_access.access_type_id": goqu.I("user_group.user_profile_id")},
-					),
-				),
-			).
-			Where(
-				goqu.And(
-					goqu.I("prayer_access.prayer_id").Eq(prayerID),
-					goqu.I("user_group.user_profile_id").Eq(userID),
-				),
-			).
-			ScanVal(&count)
-
+		hasAccess, err := userHasPrayerAccess(userID, prayerID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check prayer access", "details": err.Error()})
 			return
 		}
 
-		if !found || count == 0 {
+		if !hasAccess {
 			c.JSON(http.StatusForbidden, gin.H{"error": "You don't have access to this prayer"})
 			return
 		}
