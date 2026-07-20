@@ -267,7 +267,7 @@ func TestAddPrayerAccess(t *testing.T) {
 			expectError:    true,
 		},
 		{
-			name:        "unauthorized - no permission",
+			name:        "forbidden - no permission",
 			prayerID:    "1",
 			currentUser: MockUser(),
 			isAdmin:     false,
@@ -278,7 +278,7 @@ func TestAddPrayerAccess(t *testing.T) {
 			prayerExists:   true,
 			accessExists:   false,
 			hasPermission:  false,
-			expectedStatus: http.StatusUnauthorized,
+			expectedStatus: http.StatusForbidden,
 			expectError:    true,
 		},
 		{
@@ -340,19 +340,15 @@ func TestAddPrayerAccess(t *testing.T) {
 							"datetime_create", "datetime_update", "created_by", "updated_by",
 						}))
 
-						// Mock permission check (JOIN query) - always runs, even for admins
+						// Mock permission check (userHasPrayerAccess COUNT query) -
+						// always runs, even for admins
 						if tt.hasPermission {
-							permissionRows := sqlmock.NewRows([]string{
-								"prayer_access_id", "prayer_id", "access_type", "access_type_id",
-								"datetime_create", "datetime_update", "created_by", "updated_by",
-							}).AddRow(1, 1, "user", 1, now, now, 1, 1)
-							mock.ExpectQuery("SELECT").WillReturnRows(permissionRows)
+							mock.ExpectQuery("SELECT COUNT").
+								WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(1))
 						} else {
-							// No permission - return empty result (admin check happens after query)
-							mock.ExpectQuery("SELECT").WillReturnRows(sqlmock.NewRows([]string{
-								"prayer_access_id", "prayer_id", "access_type", "access_type_id",
-								"datetime_create", "datetime_update", "created_by", "updated_by",
-							}))
+							// No permission - count 0 (admin check happens after query)
+							mock.ExpectQuery("SELECT COUNT").
+								WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
 						}
 
 						// If authorized (hasPermission or isAdmin), mock the insert
